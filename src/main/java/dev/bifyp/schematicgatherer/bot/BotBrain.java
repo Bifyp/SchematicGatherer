@@ -7,11 +7,13 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.Container;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
@@ -25,18 +27,23 @@ import java.util.UUID;
  * Серверный «мозг» бота: очередь «что добыть» → поиск ближайшего блока →
  * подойти → сломать (прогресс разрушения как у Carpet action pack) → пока не хватит.
  *
- * Движение по-прежнему без A* (прямая + прыжок через одиночный блок), но:
+ * Движение без A* (прямая + прыжок через одиночный блок), но:
  *  - место, где бот застрял, становится «мёртвой зоной» радиусом DEAD_ZONE_RADIUS:
- *    недоступная жила вычёркивается целиком, а не по одному блоку (раньше сканер
- *    находил соседний блок той же жилы и бот спамил «не могу подойти» до бесконечности);
+ *    недоступная жила вычёркивается целиком, а не по одному блоку;
  *  - полностью замурованные блоки (ни один сосед не воздух/жидкость) пропускаются сразу;
  *  - чат не спамится: в чат идёт только первая неудача по цели, дальше тихо,
  *    а сводка «пропущено N» — при завершении цели;
  *  - после MAX_DEAD_ZONES мёртвых зон цель признаётся недостижимой и пропускается.
+ *
+ * Склад: если задан depositPos (команда /gatherbot <имя> deposit ...) и инвентарь
+ * полон — бот идёт к контейнеру и перекладывает всё, кроме предмета в активном слоте
+ * (инструмента). До недоступного/полного склада один раз сообщаем и дальше работаем
+ * без разгрузки до конца задачи.
  */
 public final class BotBrain {
 
     private static final double REACH = 4.5;
+    private static final double CHEST_REACH = 3.0;
     private static final int SCAN_INTERVAL = 20;
     private static final int STUCK_TICKS = 60;
     private static final int SCAN_VERTICAL = 12;
@@ -62,6 +69,13 @@ public final class BotBrain {
     private String jobName = "";
     private int radius = 48;
 
+    // склад (задаётся командой, живёт пока бот заспавнен)
+    private BlockPos depositPos;
+    private boolean chestUnreachable;
+    private boolean warnedFull;
+    private int chestStuckTicks;
+    private BlockPos chestLastPos;
+
     public BotBrain(GatherBot bot) {
         this.bot = bot;
     }
@@ -77,7 +91,11 @@ public final class BotBrain {
         this.owner = owner;
         this.jobName = name;
         this.radius = radius;
-        tell("§a[бот] задача «" + name + "»: позиций " + targets.size() + ", радиус поиска " + radius);
+        chestUnreachable = false;
+        warnedFull = false;
+        chestStuckTicks = 0;
+        tell("§a[бот] задача «" + name + "»: позиций " + targets.size() + ", радиус поиска " + radius
+                + (depositPos == null ? "" : ", склад: " + depositPos.toShortString()));
     }
 
     public void stopJob(boolean report) {
@@ -97,6 +115,24 @@ public final class BotBrain {
         if (current == null) return "«" + jobName + "»: между задачами, в очереди " + queue.size();
         return "«" + jobName + "»: " + current.label() + " " + countItem(current.item()) + "/" + current.needed()
                 + ", в очереди " + queue.size();
+    }
+
+    // ---------- склад ----------
+
+    public void setDeposit(BlockPos pos) {
+        this.depositPos = pos;
+        this.chestUnreachable = false;
+        this.warnedFull = false;
+        this.chestStuckTicks = 0;
+    }
+
+    public void clearDeposit() {
+        this.depositPos = null;
+        this.chestUnreachable = false;
+    }
+
+    public BlockPos getDeposit() {
+        return depositPos;
     }
 
     // ---------- тик ----------
@@ -125,6 +161,24 @@ public final class BotBrain {
             tell("§a[бот] ✔ " + current.label() + " — есть " + have + unreachableSuffix());
             nextTarget();
             return;
+        }
+
+        // инвентарь полон -> едем разгружаться (если склад задан и достижим)
+        if (isInventoryFull()) {
+            if (depositPos == null || chestUnreachable) {
+                if (!warnedFull) {
+                    warnedFull = true;
+                    tell(depositPos == null
+                            ? "§e[бот] инвентарь полон, склад не задан — дропы останутся лежать. "
+                              + "Задай: /gatherbot " + bot.getGameProfile().name() + " deposit here (глядя на сундук)"
+                            : "§e[бот] инвентарь полон, а до склада не добраться — дропы останутся лежать.");
+                }
+            } else {
+                abortMining();
+                targetPos = null;
+                depositTick();
+                return;
+            }
         }
 
         boolean needRescan = targetPos == null || !level().getBlockState(targetPos).is(current.block());
@@ -209,6 +263,69 @@ public final class BotBrain {
 
     private String unreachableSuffix() {
         return skippedUnreachable == 0 ? "" : " (недоступных блоков пропущено: " + skippedUnreachable + ")";
+    }
+
+    // ---------- склад: ходьба и разгрузка ----------
+
+    private void depositTick() {
+        double dist = bot.getEyePosition().distanceTo(Vec3.atCenterOf(depositPos));
+        if (dist > CHEST_REACH) {
+            bot.lookAt(EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(depositPos));
+            bot.zza = 1.0F;
+            bot.setSprinting(true);
+            if (bot.horizontalCollision && bot.onGround()) {
+                bot.jumpFromGround();
+            }
+            if (++chestStuckTicks >= STUCK_TICKS) {
+                if (chestLastPos != null && bot.blockPosition().distSqr(chestLastPos) < 1.0) {
+                    chestUnreachable = true;
+                    tell("§c[бот] не могу добраться до склада " + depositPos.toShortString()
+                            + " — до конца задачи работаю без разгрузки.");
+                }
+                chestStuckTicks = 0;
+                chestLastPos = bot.blockPosition();
+            }
+            return;
+        }
+        chestStuckTicks = 0;
+        bot.zza = 0;
+        bot.setSprinting(false);
+        depositItems();
+    }
+
+    /** Перекладывает в контейнер всё, кроме предмета в активном слоте (инструмента). */
+    private void depositItems() {
+        if (!(level().getBlockEntity(depositPos) instanceof Container container)) {
+            chestUnreachable = true;
+            tell("§c[бот] на " + depositPos.toShortString() + " нет контейнера — разгрузка отключена до конца задачи.");
+            return;
+        }
+        Inventory inv = bot.getInventory();
+        int moved = 0;
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            if (i == inv.getSelectedSlot()) continue; // инструмент остаётся в руке
+            ItemStack stack = inv.getItem(i);
+            if (stack.isEmpty()) continue;
+            ItemStack remainder = HopperBlockEntity.addItem(null, container, stack.copy(), null);
+            int left = remainder.isEmpty() ? 0 : remainder.getCount();
+            moved += stack.getCount() - left;
+            inv.setItem(i, left == 0 ? ItemStack.EMPTY : remainder);
+        }
+        container.setChanged();
+        if (moved > 0) {
+            tell("§7[бот] разгрузился в склад (предметов: " + moved + ")");
+        } else {
+            chestUnreachable = true;
+            tell("§c[бот] склад полон — до конца задачи работаю без разгрузки.");
+        }
+    }
+
+    private boolean isInventoryFull() {
+        Inventory inv = bot.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            if (inv.getItem(i).isEmpty()) return false;
+        }
+        return true;
     }
 
     /** Ломание блока — порт ActionType.ATTACK из Carpet (START/STOP_DESTROY_BLOCK + прогресс). */

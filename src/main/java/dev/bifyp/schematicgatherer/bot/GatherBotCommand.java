@@ -8,16 +8,21 @@ import dev.bifyp.schematicgatherer.ResourceMapper;
 import dev.bifyp.schematicgatherer.schematic.SpongeSchematic;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
+import net.minecraft.commands.arguments.coordinates.BlockPosArgument;
 import net.minecraft.commands.arguments.coordinates.Vec3Argument;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.Container;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec2;
 import net.minecraft.world.phys.Vec3;
 
@@ -37,6 +42,7 @@ import static net.minecraft.commands.Commands.literal;
 public final class GatherBotCommand {
 
     private static final int DEFAULT_RADIUS = 48;
+    private static final double DEPOSIT_RAYCAST = 6.0;
 
     private GatherBotCommand() {}
 
@@ -61,7 +67,14 @@ public final class GatherBotCommand {
                                 .then(argument("schematic", StringArgumentType.word())
                                         .executes(c -> gather(c, DEFAULT_RADIUS))
                                         .then(argument("radius", IntegerArgumentType.integer(8, 128))
-                                                .executes(c -> gather(c, IntegerArgumentType.getInteger(c, "radius"))))))));
+                                                .executes(c -> gather(c, IntegerArgumentType.getInteger(c, "radius"))))))
+                        .then(literal("deposit")
+                                .executes(GatherBotCommand::depositInfo)
+                                .then(literal("here").executes(GatherBotCommand::depositHere))
+                                .then(literal("clear").executes(GatherBotCommand::depositClear))
+                                .then(literal("set")
+                                        .then(argument("position", BlockPosArgument.blockPos())
+                                                .executes(GatherBotCommand::depositSet))))));
     }
 
     private static int spawn(CommandContext<CommandSourceStack> c, Vec3 pos) {
@@ -74,7 +87,7 @@ public final class GatherBotCommand {
         ServerLevel level = c.getSource().getLevel();
         Vec2 rot = c.getSource().getRotation();
         GatherBot.spawn(name, server, level, pos, rot.y, rot.x);
-        c.getSource().sendSystemMessage(Component.literal("§a[бот] «" + name + "» заспавнен. Выдай ему кирку и команду gather :)"));
+        c.getSource().sendSystemMessage(Component.literal("§a[бот] «" + name + "» заспавнен. Выдай ему кирку, задай склад (deposit here) и команду gather :)"));
         return 1;
     }
 
@@ -100,6 +113,59 @@ public final class GatherBotCommand {
         c.getSource().sendSystemMessage(Component.literal("§7[бот] " + bot.brain.status()));
         return 1;
     }
+
+    // ---------- склад ----------
+
+    private static int depositInfo(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        BlockPos pos = bot.brain.getDeposit();
+        c.getSource().sendSystemMessage(Component.literal(pos == null
+                ? "§7[бот] склад не задан. Задай: deposit here (глядя на сундук) или deposit set <x> <y> <z>"
+                : "§7[бот] склад: " + pos.toShortString()));
+        return 1;
+    }
+
+    private static int depositHere(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        if (!(c.getSource().getEntity() instanceof ServerPlayer player)) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] «deposit here» может использовать только игрок"));
+            return 0;
+        }
+        HitResult hit = player.pick(DEPOSIT_RAYCAST, 0.0F, false);
+        if (hit.getType() != HitResult.Type.BLOCK) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] смотри на сундук/бочку (до " + (int) DEPOSIT_RAYCAST + " блоков)"));
+            return 0;
+        }
+        return setDeposit(c, bot, ((BlockHitResult) hit).getBlockPos());
+    }
+
+    private static int depositSet(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        return setDeposit(c, bot, BlockPosArgument.getBlockPos(c, "position"));
+    }
+
+    private static int setDeposit(CommandContext<CommandSourceStack> c, GatherBot bot, BlockPos pos) {
+        if (!(c.getSource().getLevel().getBlockEntity(pos) instanceof Container)) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] " + pos.toShortString() + " — не контейнер (нужен сундук/бочка и т.п.)"));
+            return 0;
+        }
+        bot.brain.setDeposit(pos);
+        c.getSource().sendSystemMessage(Component.literal("§a[бот] склад для «" + bot.getGameProfile().name() + "»: " + pos.toShortString()));
+        return 1;
+    }
+
+    private static int depositClear(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        bot.brain.clearDeposit();
+        c.getSource().sendSystemMessage(Component.literal("§e[бот] склад сброшен — будет копить всё в инвентаре"));
+        return 1;
+    }
+
+    // ---------- сбор ----------
 
     private static int list(CommandContext<CommandSourceStack> c) {
         GatherBot bot = getBot(c);

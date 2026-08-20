@@ -39,6 +39,7 @@ public final class GatherBot extends ServerPlayer {
                 new FakeClientConnection(PacketFlow.SERVERBOUND),
                 bot,
                 new CommonListenerCookie(profile, 0, bot.clientInformation(), false));
+        bot.stopRiding();
         bot.teleportTo(level, pos.x, pos.y, pos.z, Set.of(), yaw, pitch, true);
         bot.setHealth(20.0F);
         bot.unsetRemoved();
@@ -58,7 +59,16 @@ public final class GatherBot extends ServerPlayer {
             this.connection.resetPosition();
             this.level().getChunkSource().move(this);
         }
-        super.tick();
+        try {
+            super.tick();
+            // В 26.x физика/движение/подбор предметов ServerPlayer живут в doTick().
+            // Настоящим игрокам его вызывает их сетевой слушатель, а слушатель фейка
+            // (FakeClientConnection) — заглушка -> зовём сами, как EntityPlayerMPFake
+            // в Carpet. Без этого бот просто стоял столбом (баг «бот не двигается»).
+            this.doTick();
+        } catch (NullPointerException ignored) {
+            // как в Carpet: FakeClientConnection местами NPE-шит, игра от этого не падает
+        }
         if (this.isAlive()) {
             brain.tick();
         }
