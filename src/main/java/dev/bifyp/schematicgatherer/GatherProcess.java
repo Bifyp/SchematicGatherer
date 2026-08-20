@@ -41,17 +41,19 @@ import java.util.Optional;
  * следим за инвентарём → переходим к следующей. Если #mine завершился,
  * а предметов всё ещё не хватает — один повтор, потом позиция уходит в «не удалось».
  *
- * Улучшения поведения (0.5.0):
+ * Улучшения поведения (0.5.x):
  *  - следующая цель выбирается по БЛИЗОСТИ (один проход по локальному объёму),
  *    а не тупо по количеству — меньше беготни через всю шахту туда-сюда;
  *  - после каждой цели подбирается валяющийся рядом дроп этого ресурса;
  *  - repack() не чаще раза в 5 секунд (не тупит между целями);
- *  - при старте включается настройка mineScanDroppedItems (подбор дропа во время майна).
+ *  - на время сбора allowPlace=false: БЕЗ пилларинга — не ставит мусорные блоки,
+ *    чтобы достать один блок над головой, когда рядом полно такого же на полу
+ *    (старое значение настройки возвращается после сбора/разгрузки/stop);
+ *  - при старте включается mineScanDroppedItems (подбор дропа во время майна).
  *
  * Склад (depositPos, задаётся «#gather deposit ...»). Разгрузка: при полном
  * инвентаре, после завершения сбора, по команде «deposit now». Путь строит
- * Baritone (GoalGetToBlock) — при необходимости прокапывается сам. После
- * разгрузки сбор продолжается с текущей цели.
+ * Baritone (GoalGetToBlock). После разгрузки сбор продолжается с текущей цели.
  */
 public final class GatherProcess implements Helper {
 
@@ -122,6 +124,9 @@ public final class GatherProcess implements Helper {
     private int cleanupRetries;
     private long lastRepackTick = Long.MIN_VALUE;
 
+    /** Старое значение allowPlace — возвращаем юзеру после сбора. */
+    private Boolean savedAllowPlace;
+
     // ---------- команды ----------
 
     /** Показать список материалов, ничего не добывая. */
@@ -160,6 +165,12 @@ public final class GatherProcess implements Helper {
         cleanupEntity = null;
         // подбирать валяющийся дроп нужного типа прямо во время майна
         BaritoneAPI.getSettings().mineScanDroppedItems.value = true;
+        // без пилларинга: не ставить блоки, чтобы добраться до руды над головой —
+        // берём ту, до которой реально можно дойти/докопаться
+        if (savedAllowPlace == null) {
+            savedAllowPlace = BaritoneAPI.getSettings().allowPlace.value;
+        }
+        BaritoneAPI.getSettings().allowPlace.value = false;
 
         logDirect("Схематика «" + schematicName + "»: позиций " + parsed.tasks().size() + ", предметов ~" + parsed.totalItems()
                 + (depositPos == null ? "" : ", склад: " + depositPos.toShortString()));
@@ -171,6 +182,7 @@ public final class GatherProcess implements Helper {
 
         if (parsed.tasks().isEmpty()) {
             logDirect("Добывать нечего — всё уже есть или схема пустая.");
+            restoreAllowPlace();
             return;
         }
         queue.addAll(parsed.tasks());
@@ -186,14 +198,13 @@ public final class GatherProcess implements Helper {
         depositRequested = false;
         cleanupSweep = false;
         cleanupEntity = null;
-        if (wasBusy) {
-            if (baritone != null) {
-                baritone.getCustomGoalProcess().onLostControl();
-            }
-            if (mc.player != null && mc.player.containerMenu != mc.player.inventoryMenu) {
-                mc.player.closeContainer();
-            }
+        if (wasBusy && baritone != null) {
+            baritone.getCustomGoalProcess().onLostControl();
         }
+        if (wasBusy && mc.player != null && mc.player.containerMenu != mc.player.inventoryMenu) {
+            mc.player.closeContainer();
+        }
+        restoreAllowPlace();
         if (!running) {
             logDirect(wasBusy ? "Остановлено." : "Сбор не запущен.");
             return;
@@ -404,7 +415,9 @@ public final class GatherProcess implements Helper {
             failed.forEach(f -> logDirect(" - " + f, ChatFormatting.RED));
         }
         if (goDeposit) {
-            depositRequested = true;
+            depositRequested = true; // allowPlace вернём после разгрузки (cleanupDeposit)
+        } else {
+            restoreAllowPlace();
         }
     }
 
@@ -475,6 +488,13 @@ public final class GatherProcess implements Helper {
         if (now - lastRepackTick < REPACK_COOLDOWN) return;
         lastRepackTick = now;
         BaritoneAPI.getProvider().getWorldScanner().repack(baritone.getPlayerContext());
+    }
+
+    private void restoreAllowPlace() {
+        if (savedAllowPlace != null) {
+            BaritoneAPI.getSettings().allowPlace.value = savedAllowPlace;
+            savedAllowPlace = null;
+        }
     }
 
     // ---------- склад: путь, открытие, разгрузка ----------
@@ -607,6 +627,7 @@ public final class GatherProcess implements Helper {
         if (mc.player != null && mc.player.containerMenu != mc.player.inventoryMenu) {
             mc.player.closeContainer();
         }
+        restoreAllowPlace(); // если это была финальная разгрузка после сбора — возвращаем настройку
     }
 
     /** После разгрузки продолжаем прерванную цель. */
