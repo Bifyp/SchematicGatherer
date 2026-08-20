@@ -23,9 +23,10 @@ loom {
 
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    // Пустой набор слоёв = имена такие же, как в jar игры.
+    // Полностью пустой layered падает (srcNamespace = null), поэтому даём минимальный
+    // tiny-файл official -> named без реальных переименований (identity).
     mappings loom.layered {
-        // без слоёв имён
+        it.mappings file("mappings/26.1-identity.tiny")
     }
 
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
