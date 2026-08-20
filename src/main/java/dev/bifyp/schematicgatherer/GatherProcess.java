@@ -12,12 +12,13 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.InteractionHand;
-import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -405,6 +406,9 @@ public final class GatherProcess implements Helper {
      * Shift-кликаем предметы в открытый контейнер. В стандартных меню (сундук,
      * бочка, шалкер, воронка) слоты игрока — всегда последние 36, хотбар — последние 9.
      * Инструмент в активном слоте не трогаем, чтобы копать было чем.
+     *
+     * В 26.1 старый ClickType/handleInventoryMouseClick переименован в
+     * ContainerInput/handleContainerInput (см. litematica LTS/26.1).
      */
     private int dumpSome(Minecraft mc) {
         var menu = mc.player.containerMenu;
@@ -416,7 +420,7 @@ public final class GatherProcess implements Helper {
             if (i == heldMenuSlot) continue;
             Slot slot = menu.slots.get(i);
             if (!slot.hasItem()) continue;
-            mc.gameMode.handleInventoryMouseClick(menu.containerId, i, 0, ClickType.QUICK_MOVE, mc.player);
+            mc.gameMode.handleContainerInput(menu.containerId, i, 0, ContainerInput.QUICK_MOVE, mc.player);
             moved++;
         }
         return moved;
