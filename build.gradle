@@ -1,7 +1,8 @@
 plugins {
     id 'java'
-    // Если эта версия не резолвится — возьми актуальную с https://fabricmc.net/develop/template/
-    id 'fabric-loom' version '1.11-SNAPSHOT'
+    // Версия loom, которой собирается carpet под 26.x. Если не резолвится —
+    // возьми актуальную с https://fabricmc.net/develop/template/
+    id 'fabric-loom' version '1.17-SNAPSHOT'
 }
 
 base {
@@ -18,7 +19,8 @@ dependencies {
     // '+' = последняя Fabric API; при проблемах зафиксируй конкретную версию в gradle.properties
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
-    // Baritone API: положи jar в libs/baritone-fabric.jar (см. README, шаг 2 сборки)
+    // Baritone API (только для клиентской команды #gather):
+    // положи jar в libs/baritone-fabric.jar (см. README, шаг сборки)
     compileOnly files("libs/baritone-fabric.jar")
 }
 
