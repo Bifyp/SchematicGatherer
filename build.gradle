@@ -68,9 +68,16 @@ processResources {
     inputs.property "version", project.version
     inputs.property "baritone", baritonePresent
     filesMatching("fabric.mod.json") {
-        // без Baritone клиентский entrypoint не существует — подставляем пустой список
-        expand "version": project.version,
-                "client_entry": baritonePresent ? '"dev.bifyp.schematicgatherer.SchematicGathererMod"' : ''
+        expand "version": project.version
+        // Loom читает ИСХОДНЫЙ fabric.mod.json на этапе конфигурации, поэтому файл
+        // всегда должен быть валидным JSON (никаких ${...} внутри массивов).
+        // Без Baritone класса SchematicGathererMod в jar нет -> вырезаем строку
+        // с клиентским entrypoint, остаётся "client": [].
+        if (!baritonePresent) {
+            filter { String line ->
+                line.contains("dev.bifyp.schematicgatherer.SchematicGathererMod") ? null : line
+            }
+        }
     }
 }
 
