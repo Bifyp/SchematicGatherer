@@ -54,8 +54,13 @@ dependencies {
     // '+' = последняя Fabric API; при проблемах зафиксируй конкретную версию в gradle.properties
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
-    // Baritone API (только для клиентской команды #gather):
-    // положи jar в libs/baritone-fabric.jar (см. README)
+    // Baritone API (только для клиентской команды #gather).
+    // Положи ИМЕННО baritone-unoptimized-fabric-*.jar как libs/baritone-fabric.jar:
+    //  - standalone обфусцирует baritone.api целиком -> "package baritone.api does not exist";
+    //  - api-флейвор проходит через ProGuard без -keepattributes Exceptions, поэтому у
+    //    ICommand.execute/tabComplete пропадает "throws CommandException" и наши @Override
+    //    перестают компилироваться.
+    // Подробности: libs/README.txt
     compileOnly files("libs/baritone-fabric.jar")
 }
 
