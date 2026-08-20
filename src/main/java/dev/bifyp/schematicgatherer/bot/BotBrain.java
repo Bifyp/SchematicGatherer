@@ -18,17 +18,21 @@ import net.minecraft.world.phys.Vec3;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.UUID;
 
 /**
  * Серверный «мозг» бота: очередь «что добыть» → поиск ближайшего блока →
  * подойти → сломать (прогресс разрушения как у Carpet action pack) → пока не хватит.
  *
- * Без A*: идёт по прямой и прыгает через одиночные блоки. Открытая местность — ок,
- * сложные пещеры с обходами — не его лига (для этого есть клиентский #gather через Baritone).
+ * Движение по-прежнему без A* (прямая + прыжок через одиночный блок), но:
+ *  - место, где бот застрял, становится «мёртвой зоной» радиусом DEAD_ZONE_RADIUS:
+ *    недоступная жила вычёркивается целиком, а не по одному блоку (раньше сканер
+ *    находил соседний блок той же жилы и бот спамил «не могу подойти» до бесконечности);
+ *  - полностью замурованные блоки (ни один сосед не воздух/жидкость) пропускаются сразу;
+ *  - чат не спамится: в чат идёт только первая неудача по цели, дальше тихо,
+ *    а сводка «пропущено N» — при завершении цели;
+ *  - после MAX_DEAD_ZONES мёртвых зон цель признаётся недостижимой и пропускается.
  */
 public final class BotBrain {
 
@@ -36,11 +40,15 @@ public final class BotBrain {
     private static final int SCAN_INTERVAL = 20;
     private static final int STUCK_TICKS = 60;
     private static final int SCAN_VERTICAL = 12;
+    /** Радиус кластера вокруг точки застревания, который считаем недоступным целиком. */
+    private static final int DEAD_ZONE_RADIUS = 8;
+    /** Сколько мёртвых зон по одной цели терпим, прежде чем сдаться. */
+    private static final int MAX_DEAD_ZONES = 60;
 
     private final GatherBot bot;
     private final Deque<GatherTarget> queue = new ArrayDeque<>();
     private final List<String> failed = new ArrayList<>();
-    private final Set<BlockPos> unreachable = new HashSet<>();
+    private final List<BlockPos> deadZones = new ArrayList<>();
 
     private GatherTarget current;
     private BlockPos targetPos;
@@ -49,6 +57,7 @@ public final class BotBrain {
     private int scanCooldown;
     private int stuckTicks;
     private BlockPos lastPos;
+    private int skippedUnreachable;
     private UUID owner;
     private String jobName = "";
     private int radius = 48;
@@ -79,7 +88,7 @@ public final class BotBrain {
         queue.clear();
         current = null;
         targetPos = null;
-        unreachable.clear();
+        deadZones.clear();
         if (report) tell("§e[бот] задача остановлена.");
     }
 
@@ -104,7 +113,8 @@ public final class BotBrain {
             tell("§7[бот] цель: " + current.label() + " ×" + current.needed()
                     + (current.note().isEmpty() ? "" : " (" + current.note() + ")"));
             targetPos = null;
-            unreachable.clear();
+            deadZones.clear();
+            skippedUnreachable = 0;
             stuckTicks = 0;
             scanCooldown = 0;
             lastPos = bot.blockPosition();
@@ -112,7 +122,7 @@ public final class BotBrain {
 
         int have = countItem(current.item());
         if (have >= current.needed()) {
-            tell("§a[бот] ✔ " + current.label() + " — есть " + have);
+            tell("§a[бот] ✔ " + current.label() + " — есть " + have + unreachableSuffix());
             nextTarget();
             return;
         }
@@ -125,9 +135,7 @@ public final class BotBrain {
                 scanCooldown = SCAN_INTERVAL;
                 targetPos = findNearest(current.block());
                 if (targetPos == null) {
-                    failed.add(current.label() + " — не найден в радиусе " + radius);
-                    tell("§c[бот] ✖ не нашёл " + current.label() + " в радиусе " + radius + ". Пропускаю.");
-                    nextTarget();
+                    giveUpCurrent();
                     return;
                 }
                 stuckTicks = 0;
@@ -146,6 +154,16 @@ public final class BotBrain {
         }
     }
 
+    /** Цель провалена: либо блоков нет вовсе, либо всё найденное оказалось недоступным. */
+    private void giveUpCurrent() {
+        String reason = deadZones.isEmpty()
+                ? "не найден в радиусе " + radius
+                : "все найденные участки недоступны (мёртвых зон: " + deadZones.size() + ")";
+        failed.add(current.label() + " — " + reason);
+        tell("§c[бот] ✖ " + current.label() + ": " + reason + ". Пропускаю.");
+        nextTarget();
+    }
+
     private void nextTarget() {
         abortMining();
         current = null;
@@ -161,17 +179,36 @@ public final class BotBrain {
         if (bot.horizontalCollision && bot.onGround()) {
             bot.jumpFromGround();
         }
-        // застревание: не сдвинулся за STUCK_TICKS — эта точка недостижима
+        // застревание: не сдвинулся за STUCK_TICKS — точка и весь участок вокруг неё недостижимы
         if (++stuckTicks >= STUCK_TICKS) {
             if (lastPos != null && bot.blockPosition().distSqr(lastPos) < 1.0) {
-                unreachable.add(pos);
-                tell("§e[бот] не могу подойти к " + pos.toShortString() + ", ищу другой " + current.label());
+                markUnreachable(pos);
                 targetPos = null;
                 scanCooldown = 1;
             }
             stuckTicks = 0;
             lastPos = bot.blockPosition();
         }
+    }
+
+    /**
+     * Метит кластер вокруг точки недоступным. В чат — только первая неудача по цели,
+     * дальше тихо (сводка будет в unreachableSuffix при завершении цели).
+     */
+    private void markUnreachable(BlockPos pos) {
+        deadZones.add(pos);
+        skippedUnreachable++;
+        if (skippedUnreachable == 1) {
+            tell("§e[бот] не могу подойти к " + pos.toShortString()
+                    + " — вычёркиваю участок и ищу другой " + current.label());
+        }
+        if (deadZones.size() >= MAX_DEAD_ZONES) {
+            giveUpCurrent();
+        }
+    }
+
+    private String unreachableSuffix() {
+        return skippedUnreachable == 0 ? "" : " (недоступных блоков пропущено: " + skippedUnreachable + ")";
     }
 
     /** Ломание блока — порт ActionType.ATTACK из Carpet (START/STOP_DESTROY_BLOCK + прогресс). */
@@ -218,7 +255,8 @@ public final class BotBrain {
                     pos.set(center.getX() + dx, center.getY() + dy, center.getZ() + dz);
                     if (!level.hasChunkAt(pos)) continue;
                     if (!level.getBlockState(pos).is(block)) continue;
-                    if (unreachable.contains(pos)) continue;
+                    if (inDeadZone(pos)) continue;
+                    if (!isExposed(level, pos)) continue;
                     double d = pos.distSqr(center);
                     if (d < bestDist) {
                         bestDist = d;
@@ -228,6 +266,24 @@ public final class BotBrain {
             }
         }
         return best;
+    }
+
+    /** До полностью замурованного блока всё равно ни дойти, ни доломать — пропускаем сразу. */
+    private static boolean isExposed(ServerLevel level, BlockPos pos) {
+        for (Direction dir : Direction.values()) {
+            BlockPos neighbor = pos.relative(dir);
+            if (!level.hasChunkAt(neighbor)) continue;
+            BlockState state = level.getBlockState(neighbor);
+            if (state.isAir() || !state.getFluidState().isEmpty()) return true;
+        }
+        return false;
+    }
+
+    private boolean inDeadZone(BlockPos pos) {
+        for (BlockPos zone : deadZones) {
+            if (pos.distSqr(zone) <= (double) DEAD_ZONE_RADIUS * DEAD_ZONE_RADIUS) return true;
+        }
+        return false;
     }
 
     /** Берёт в руку самый быстрый инструмент из хотбара для этого блока. */
