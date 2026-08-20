@@ -33,7 +33,9 @@ sourceSets {
     main {
         java {
             if (!baritonePresent) {
+                // всё, что импортирует baritone.api.* (и тот, кто ссылается на BaritoneHook)
                 exclude "dev/bifyp/schematicgatherer/SchematicGathererMod.java"
+                exclude "dev/bifyp/schematicgatherer/BaritoneHook.java"
                 exclude "dev/bifyp/schematicgatherer/GatherCommand.java"
                 exclude "dev/bifyp/schematicgatherer/GatherProcess.java"
                 exclude "dev/bifyp/schematicgatherer/MaterialCounter.java"
