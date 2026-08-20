@@ -13,7 +13,8 @@ group = project.maven_group
 
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    mappings loom.officialMojangMappings()
+    // Начиная с 26.1 Minecraft больше не обфусцирован: официальных маппингов нет,
+    // блок mappings не нужен вовсе (как у carpet) — имена в jar уже настоящие.
 
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     // '+' = последняя Fabric API; при проблемах зафиксируй конкретную версию в gradle.properties
