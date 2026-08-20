@@ -71,6 +71,7 @@ public final class GatherBotCommand {
                         .then(literal("deposit")
                                 .executes(GatherBotCommand::depositInfo)
                                 .then(literal("here").executes(GatherBotCommand::depositHere))
+                                .then(literal("now").executes(GatherBotCommand::depositNow))
                                 .then(literal("clear").executes(GatherBotCommand::depositClear))
                                 .then(literal("set")
                                         .then(argument("position", BlockPosArgument.blockPos())
@@ -122,7 +123,7 @@ public final class GatherBotCommand {
         BlockPos pos = bot.brain.getDeposit();
         c.getSource().sendSystemMessage(Component.literal(pos == null
                 ? "§7[бот] склад не задан. Задай: deposit here (глядя на сундук) или deposit set <x> <y> <z>"
-                : "§7[бот] склад: " + pos.toShortString()));
+                : "§7[бот] склад: " + pos.toShortString() + " (разгрузиться сейчас: deposit now)"));
         return 1;
     }
 
@@ -139,6 +140,18 @@ public final class GatherBotCommand {
             return 0;
         }
         return setDeposit(c, bot, ((BlockHitResult) hit).getBlockPos());
+    }
+
+    private static int depositNow(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        if (bot.brain.getDeposit() == null) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] склад не задан. Сначала: deposit here (глядя на сундук) или deposit set <x> <y> <z>"));
+            return 0;
+        }
+        bot.brain.requestDeposit();
+        c.getSource().sendSystemMessage(Component.literal("§7[бот] «" + bot.getGameProfile().name() + "» пошёл разгружаться на склад"));
+        return 1;
     }
 
     private static int depositSet(CommandContext<CommandSourceStack> c) {

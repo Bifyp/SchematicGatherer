@@ -27,18 +27,14 @@ import java.util.UUID;
  * Серверный «мозг» бота: очередь «что добыть» → поиск ближайшего блока →
  * подойти → сломать (прогресс разрушения как у Carpet action pack) → пока не хватит.
  *
- * Движение без A* (прямая + прыжок через одиночный блок), но:
- *  - место, где бот застрял, становится «мёртвой зоной» радиусом DEAD_ZONE_RADIUS:
- *    недоступная жила вычёркивается целиком, а не по одному блоку;
- *  - полностью замурованные блоки (ни один сосед не воздух/жидкость) пропускаются сразу;
- *  - чат не спамится: в чат идёт только первая неудача по цели, дальше тихо,
- *    а сводка «пропущено N» — при завершении цели;
- *  - после MAX_DEAD_ZONES мёртвых зон цель признаётся недостижимой и пропускается.
+ * Движение без A* (прямая + прыжок через одиночный блок), с «мёртвыми зонами»
+ * вокруг мест застревания и без спама в чат.
  *
- * Склад: если задан depositPos (команда /gatherbot <имя> deposit ...) и инвентарь
- * полон — бот идёт к контейнеру и перекладывает всё, кроме предмета в активном слоте
- * (инструмента). До недоступного/полного склада один раз сообщаем и дальше работаем
- * без разгрузки до конца задачи.
+ * Склад (depositPos, задаётся /gatherbot <имя> deposit ...). Разгрузка случается:
+ *  - когда инвентарь полностью заполнен во время задачи;
+ *  - после завершения задачи (если есть что нести);
+ *  - по команде «deposit now» — в любой момент, даже без задачи.
+ * Перекладывается всё, кроме предмета в активном слоте (инструмента).
  */
 public final class BotBrain {
 
@@ -71,6 +67,7 @@ public final class BotBrain {
 
     // склад (задаётся командой, живёт пока бот заспавнен)
     private BlockPos depositPos;
+    private boolean depositRequested;
     private boolean chestUnreachable;
     private boolean warnedFull;
     private int chestStuckTicks;
@@ -107,6 +104,7 @@ public final class BotBrain {
         current = null;
         targetPos = null;
         deadZones.clear();
+        depositRequested = false;
         if (report) tell("§e[бот] задача остановлена.");
     }
 
@@ -135,11 +133,28 @@ public final class BotBrain {
         return depositPos;
     }
 
+    /** Ручная команда «deposit now»: дойти до склада и разгрузиться прямо сейчас. */
+    public void requestDeposit() {
+        chestUnreachable = false; // после ручной команды даём складу второй шанс
+        chestStuckTicks = 0;
+        depositRequested = true;
+    }
+
     // ---------- тик ----------
 
     public void tick() {
         if (bot.isRemoved()) {
             stopJob(false);
+            return;
+        }
+
+        // разгрузка по команде / после задачи — работает и без активной задачи
+        if (depositRequested) {
+            abortMining();
+            targetPos = null;
+            if (depositPos == null || chestUnreachable || depositTick()) {
+                depositRequested = false;
+            }
             return;
         }
 
@@ -163,7 +178,7 @@ public final class BotBrain {
             return;
         }
 
-        // инвентарь полон -> едем разгружаться (если склад задан и достижим)
+        // инвентарь полон -> идём разгружаться (если склад задан и достижим)
         if (isInventoryFull()) {
             if (depositPos == null || chestUnreachable) {
                 if (!warnedFull) {
@@ -267,7 +282,8 @@ public final class BotBrain {
 
     // ---------- склад: ходьба и разгрузка ----------
 
-    private void depositTick() {
+    /** @return true — разгрузка завершена (успешно переложили или отказались от попыток). */
+    private boolean depositTick() {
         double dist = bot.getEyePosition().distanceTo(Vec3.atCenterOf(depositPos));
         if (dist > CHEST_REACH) {
             bot.lookAt(EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(depositPos));
@@ -280,24 +296,26 @@ public final class BotBrain {
                 if (chestLastPos != null && bot.blockPosition().distSqr(chestLastPos) < 1.0) {
                     chestUnreachable = true;
                     tell("§c[бот] не могу добраться до склада " + depositPos.toShortString()
-                            + " — до конца задачи работаю без разгрузки.");
+                            + " — разгрузка выключена. Перезадай: deposit here / deposit set");
+                    return true;
                 }
                 chestStuckTicks = 0;
                 chestLastPos = bot.blockPosition();
             }
-            return;
+            return false;
         }
         chestStuckTicks = 0;
         bot.zza = 0;
         bot.setSprinting(false);
         depositItems();
+        return true;
     }
 
     /** Перекладывает в контейнер всё, кроме предмета в активном слоте (инструмента). */
     private void depositItems() {
         if (!(level().getBlockEntity(depositPos) instanceof Container container)) {
             chestUnreachable = true;
-            tell("§c[бот] на " + depositPos.toShortString() + " нет контейнера — разгрузка отключена до конца задачи.");
+            tell("§c[бот] на " + depositPos.toShortString() + " нет контейнера — разгрузка отключена.");
             return;
         }
         Inventory inv = bot.getInventory();
@@ -316,7 +334,7 @@ public final class BotBrain {
             tell("§7[бот] разгрузился в склад (предметов: " + moved + ")");
         } else {
             chestUnreachable = true;
-            tell("§c[бот] склад полон — до конца задачи работаю без разгрузки.");
+            tell("§c[бот] склад полон — разгрузка отключена.");
         }
     }
 
@@ -326,6 +344,15 @@ public final class BotBrain {
             if (inv.getItem(i).isEmpty()) return false;
         }
         return true;
+    }
+
+    private boolean hasAnythingToDeposit() {
+        Inventory inv = bot.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            if (i == inv.getSelectedSlot()) continue;
+            if (!inv.getItem(i).isEmpty()) return true;
+        }
+        return false;
     }
 
     /** Ломание блока — порт ActionType.ATTACK из Carpet (START/STOP_DESTROY_BLOCK + прогресс). */
@@ -421,7 +448,8 @@ public final class BotBrain {
     }
 
     private void finish() {
-        tell("§a[бот] ✔ задача «" + jobName + "» завершена!");
+        boolean goDeposit = depositPos != null && !chestUnreachable && hasAnythingToDeposit();
+        tell("§a[бот] ✔ задача «" + jobName + "» завершена!" + (goDeposit ? " Несу добытое на склад…" : ""));
         if (!failed.isEmpty()) {
             tell("§c[бот] не удалось:");
             failed.forEach(f -> tell("§c - " + f));
@@ -429,6 +457,7 @@ public final class BotBrain {
         failed.clear();
         bot.zza = 0;
         bot.setSprinting(false);
+        depositRequested = goDeposit;
     }
 
     private int countItem(Item item) {
