@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Java 25 — под Minecraft 26.1 (как в ветке baritone 26.1)
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      # Baritone нужен только чтобы скомпилировать клиентскую команду #gather.
+      # Готового maven-артефакта под 26.1 нет, поэтому собираем из исходников
+      # и кэшируем (пересборка — только если поменять key).
+      - name: Cache Baritone jar
+        id: baritone-cache
+        uses: actions/cache@v4
+        with:
+          path: libs/baritone-fabric.jar
+          key: baritone-26.1-1
+
+      - name: Build Baritone (branch 26.1)
+        if: steps.baritone-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch 26.1 https://github.com/cabaletta/baritone.git baritone-src
+          cd baritone-src
+          chmod +x gradlew
+          ./gradlew :fabric:remapJar --no-daemon
+          cd ..
+          mkdir -p libs
+          JAR=$(find baritone-src/fabric/build/libs -name "baritone-fabric-*.jar" ! -name "*-dev*" ! -name "*-sources*" | sort | head -1)
+          echo "Baritone jar: $JAR"
+          cp "$JAR" libs/baritone-fabric.jar
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.1.0"
+
+      - name: Build SchematicGatherer
+        run: gradle build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: schematic-gatherer
+          path: build/libs/*.jar
