@@ -11,21 +11,29 @@ base {
 version = project.mod_version
 group = project.maven_group
 
+loom {
+    // С 26.1 Minecraft больше не обфусцирован:
+    //  - official mojang mappings не существуют (client_mappings нет в манифесте версии),
+    //  - yarn для 26.x не выпускается (последний — 1.21.11),
+    //  - intermediary 26.1 лежит с битой метадатой (bad version: found='0.0.0').
+    // Поэтому работаем прямо на официальных именах классов (без промежуточных маппингов).
+    noIntermediateMappings()
+    productionNamespace = "official"
+}
+
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
-
-    // С 26.1 Minecraft больше не обфусцирован: official mojang mappings НЕ существует
-    // (loom ругается "Failed to find official mojang mappings"), yarn для 26.x нет.
-    // Fabric публикует intermediary 26.1 — по сути тождественный (имена = официальные),
-    // но loom требует непустой mappings-артефакт.
-    mappings "net.fabricmc:intermediary:${project.minecraft_version}:v2"
+    // Пустой набор слоёв = имена такие же, как в jar игры.
+    mappings loom.layered {
+        // без слоёв имён
+    }
 
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     // '+' = последняя Fabric API; при проблемах зафиксируй конкретную версию в gradle.properties
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
     // Baritone API (только для клиентской команды #gather):
-    // положи jar в libs/baritone-fabric.jar (см. README, шаг сборки)
+    // положи jar в libs/baritone-fabric.jar (см. README)
     compileOnly files("libs/baritone-fabric.jar")
 }
 
