@@ -9,7 +9,7 @@
   "environment": "*",
   "entrypoints": {
     "main": ["dev.bifyp.schematicgatherer.SchematicGathererInit"],
-    "client": ["dev.bifyp.schematicgatherer.SchematicGathererMod"]
+    "client": [${client_entry}]
   },
   "mixins": ["schematic-gatherer.mixins.json"],
   "depends": {

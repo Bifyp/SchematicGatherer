@@ -11,6 +11,14 @@ base {
 version = project.mod_version
 group = project.maven_group
 
+// Baritone нужен ТОЛЬКО клиентской части (#gather). Если jar не положили в libs/ —
+// собираем серверную часть (/gatherbot), иначе javac падает на baritone.api.*
+def baritoneJar = file("libs/baritone-fabric.jar")
+def baritonePresent = baritoneJar.exists()
+if (!baritonePresent) {
+    logger.lifecycle("[schematic-gatherer] libs/baritone-fabric.jar не найден -> собираю только серверную часть (/gatherbot), команда #gather выключена")
+}
+
 loom {
     // С 26.1 Minecraft больше не обфусцирован:
     //  - official mojang mappings не существуют (client_mappings нет в манифесте версии),
@@ -19,6 +27,19 @@ loom {
     // Поэтому работаем прямо на официальных именах классов (без промежуточных маппингов).
     noIntermediateMappings()
     productionNamespace = "official"
+}
+
+sourceSets {
+    main {
+        java {
+            if (!baritonePresent) {
+                exclude "dev/bifyp/schematicgatherer/SchematicGathererMod.java"
+                exclude "dev/bifyp/schematicgatherer/GatherCommand.java"
+                exclude "dev/bifyp/schematicgatherer/GatherProcess.java"
+                exclude "dev/bifyp/schematicgatherer/MaterialCounter.java"
+            }
+        }
+    }
 }
 
 dependencies {
@@ -40,8 +61,11 @@ dependencies {
 
 processResources {
     inputs.property "version", project.version
+    inputs.property "baritone", baritonePresent
     filesMatching("fabric.mod.json") {
-        expand "version": project.version
+        // без Baritone клиентский entrypoint не существует — подставляем пустой список
+        expand "version": project.version,
+                "client_entry": baritonePresent ? '"dev.bifyp.schematicgatherer.SchematicGathererMod"' : ''
     }
 }
 

@@ -17,7 +17,9 @@ public final class FakeClientConnection extends Connection {
 
     public FakeClientConnection(PacketFlow flow) {
         super(flow);
-        ((ConnectionAccessor) this).schematicgatherer$setChannel(new EmbeddedChannel());
+        // Интерфейс ConnectionAccessor подмешивается в Connection только в рантайме,
+        // поэтому для javac приводим через Object (класс final, прямой каст запрещён).
+        ((ConnectionAccessor) (Object) this).schematicgatherer$setChannel(new EmbeddedChannel());
     }
 
     @Override

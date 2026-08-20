@@ -7,6 +7,7 @@ import com.mojang.brigadier.context.CommandContext;
 import dev.bifyp.schematicgatherer.ResourceMapper;
 import dev.bifyp.schematicgatherer.schematic.SpongeSchematic;
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
 import net.minecraft.commands.arguments.coordinates.Vec3Argument;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
@@ -41,7 +42,8 @@ public final class GatherBotCommand {
 
     public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
         dispatcher.register(literal("gatherbot")
-                .requires(src -> src.hasPermission(2))
+                // в 26.x проверка прав идёт через PermissionSource, а не hasPermission(int)
+                .requires(src -> Commands.LEVEL_GAMEMASTERS.check(src.permissions()))
                 .then(literal("spawn")
                         .then(argument("name", StringArgumentType.word())
                                 .executes(c -> spawn(c, c.getSource().getPosition()))
