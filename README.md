@@ -61,13 +61,22 @@
 - Для `#gather` Baritone копает только то, что уже видел (world cache) —
   для больших объёмов сначала `#explore`.
 
-## Сборка
+## Готовый jar без локальной сборки
 
-Нужны **JDK 25** и **Gradle 9.1+**.
+В репозитории настроен GitHub Actions: каждый пуш собирает мод
+(включая Baritone 26.1 из исходников — нужен только на этапе компиляции).
+Готовый jar забирай из **Actions → последний запуск build → Artifacts → `schematic-gatherer`**.
+
+## Сборка локально
+
+Нужны **JDK 25** и **Gradle 9.5+** (loom 1.17-SNAPSHOT собран под Gradle 9.5 —
+на 9.4 и старше будет ошибка `Could not resolve net.fabricmc:fabric-loom`).
 
 1. (Только для `#gather`) скачай jar Baritone для Fabric из ветки `26.1` и положи в
    `libs/baritone-fabric.jar` — он нужен лишь для компиляции. Если Baritone не нужен,
-   удали `SchematicGathererMod.java` + `GatherCommand.java` и соберёшь только `/gatherbot`.
+   удали `SchematicGathererMod.java`, `GatherCommand.java`, `GatherProcess.java`,
+   `MaterialCounter.java` и строку `"client": ...` из `fabric.mod.json` —
+   соберётся версия только с `/gatherbot`.
 2. `gradle build` → jar в `build/libs/schematic-gatherer-0.2.0.jar`.
 
 ## Установка
