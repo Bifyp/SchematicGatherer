@@ -7,6 +7,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.Container;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.player.Inventory;
@@ -34,6 +35,11 @@ import java.util.UUID;
  *  - когда инвентарь полностью заполнен во время задачи;
  *  - после завершения задачи (если есть что нести);
  *  - по команде «deposit now» — в любой момент, даже без задачи.
+ *
+ * Если до склада по прямой не дойти (шахта, стена), бот ПРОКАПЫВАЕТСЯ:
+ * туннель 1×2 вперёд, при складе ниже — ступеньки вниз (ломает пол перед собой).
+ * Предохранители: не ломает неломаемое, отказывается при лаве в ячейке или рядом
+ * с ней, не копает вверх, лимит MAX_TUNNEL_BLOCKS блоков за один заход.
  * Перекладывается всё, кроме предмета в активном слоте (инструмента).
  */
 public final class BotBrain {
@@ -47,6 +53,8 @@ public final class BotBrain {
     private static final int DEAD_ZONE_RADIUS = 8;
     /** Сколько мёртвых зон по одной цели терпим, прежде чем сдаться. */
     private static final int MAX_DEAD_ZONES = 60;
+    /** Сколько блоков максимум прокапываем за один поход к складу. */
+    private static final int MAX_TUNNEL_BLOCKS = 64;
 
     private final GatherBot bot;
     private final Deque<GatherTarget> queue = new ArrayDeque<>();
@@ -72,6 +80,10 @@ public final class BotBrain {
     private boolean warnedFull;
     private int chestStuckTicks;
     private BlockPos chestLastPos;
+    // прокапывание к складу
+    private final List<BlockPos> diggingCells = new ArrayList<>();
+    private int dugThisTrip;
+    private String digFailReason = "";
 
     public BotBrain(GatherBot bot) {
         this.bot = bot;
@@ -91,6 +103,8 @@ public final class BotBrain {
         chestUnreachable = false;
         warnedFull = false;
         chestStuckTicks = 0;
+        diggingCells.clear();
+        dugThisTrip = 0;
         tell("§a[бот] задача «" + name + "»: позиций " + targets.size() + ", радиус поиска " + radius
                 + (depositPos == null ? "" : ", склад: " + depositPos.toShortString()));
     }
@@ -105,6 +119,7 @@ public final class BotBrain {
         targetPos = null;
         deadZones.clear();
         depositRequested = false;
+        diggingCells.clear();
         if (report) tell("§e[бот] задача остановлена.");
     }
 
@@ -122,11 +137,14 @@ public final class BotBrain {
         this.chestUnreachable = false;
         this.warnedFull = false;
         this.chestStuckTicks = 0;
+        this.diggingCells.clear();
+        this.dugThisTrip = 0;
     }
 
     public void clearDeposit() {
         this.depositPos = null;
         this.chestUnreachable = false;
+        this.diggingCells.clear();
     }
 
     public BlockPos getDeposit() {
@@ -137,6 +155,7 @@ public final class BotBrain {
     public void requestDeposit() {
         chestUnreachable = false; // после ручной команды даём складу второй шанс
         chestStuckTicks = 0;
+        dugThisTrip = 0;
         depositRequested = true;
     }
 
@@ -280,34 +299,137 @@ public final class BotBrain {
         return skippedUnreachable == 0 ? "" : " (недоступных блоков пропущено: " + skippedUnreachable + ")";
     }
 
-    // ---------- склад: ходьба и разгрузка ----------
+    // ---------- склад: ходьба, прокапывание, разгрузка ----------
 
     /** @return true — разгрузка завершена (успешно переложили или отказались от попыток). */
     private boolean depositTick() {
         double dist = bot.getEyePosition().distanceTo(Vec3.atCenterOf(depositPos));
-        if (dist > CHEST_REACH) {
-            bot.lookAt(EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(depositPos));
-            bot.zza = 1.0F;
-            bot.setSprinting(true);
-            if (bot.horizontalCollision && bot.onGround()) {
-                bot.jumpFromGround();
+        if (dist <= CHEST_REACH) {
+            chestStuckTicks = 0;
+            diggingCells.clear();
+            bot.zza = 0;
+            bot.setSprinting(false);
+            depositItems();
+            return true;
+        }
+
+        // режим «прокапываюсь»: ломаем очередную ячейку туннеля
+        if (!diggingCells.isEmpty()) {
+            BlockPos cell = diggingCells.get(0);
+            if (level().getBlockState(cell).isAir() || !level().getFluidState(cell).isEmpty()) {
+                diggingCells.remove(0);
+                dugThisTrip++;
+                return false;
             }
-            if (++chestStuckTicks >= STUCK_TICKS) {
-                if (chestLastPos != null && bot.blockPosition().distSqr(chestLastPos) < 1.0) {
-                    chestUnreachable = true;
-                    tell("§c[бот] не могу добраться до склада " + depositPos.toShortString()
-                            + " — разгрузка выключена. Перезадай: deposit here / deposit set");
-                    return true;
-                }
-                chestStuckTicks = 0;
-                chestLastPos = bot.blockPosition();
-            }
+            bot.zza = 0;
+            bot.setSprinting(false);
+            mine(cell);
             return false;
         }
-        chestStuckTicks = 0;
-        bot.zza = 0;
-        bot.setSprinting(false);
-        depositItems();
+
+        // обычная ходьба к складу
+        bot.lookAt(EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(depositPos));
+        bot.zza = 1.0F;
+        bot.setSprinting(true);
+        if (bot.horizontalCollision && bot.onGround()) {
+            bot.jumpFromGround();
+        }
+
+        // стоп, если путь пошёл через лаву
+        if (level().getFluidState(bot.blockPosition()).is(FluidTags.LAVA)) {
+            bot.zza = 0;
+            chestUnreachable = true;
+            tell("§c[бот] путь к складу идёт через лаву — стою. Перенеси меня или перезадай склад.");
+            return true;
+        }
+
+        if (++chestStuckTicks >= STUCK_TICKS) {
+            boolean noProgress = chestLastPos != null && bot.blockPosition().distSqr(chestLastPos) < 1.0;
+            chestStuckTicks = 0;
+            chestLastPos = bot.blockPosition();
+            if (noProgress) {
+                if (dugThisTrip >= MAX_TUNNEL_BLOCKS) {
+                    chestUnreachable = true;
+                    tell("§c[бот] прокопал " + dugThisTrip + " блоков и не дошёл — склад слишком далеко. "
+                            + "Перенеси меня ближе или перезадай склад.");
+                    return true;
+                }
+                List<BlockPos> plan = planDigCells();
+                if (plan == null) {
+                    chestUnreachable = true;
+                    tell("§c[бот] не могу прокопаться к складу: " + digFailReason + ". Разгрузка выключена.");
+                    return true;
+                }
+                if (plan.isEmpty()) {
+                    chestUnreachable = true;
+                    tell("§c[бот] застрял, но ломать нечего (впереди пусто) — не могу добраться до склада "
+                            + depositPos.toShortString());
+                    return true;
+                }
+                diggingCells.addAll(plan);
+                tell("§7[бот] прокапываюсь к складу…");
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Планирует, какие ячейки сломать для следующего шага к складу.
+     * @return список ячеек (может быть пустым) или null, если копать небезопасно/бессмысленно
+     *         (причина в digFailReason).
+     */
+    private List<BlockPos> planDigCells() {
+        Direction dir = bot.getDirection(); // в ходьбе бот смотрит на склад
+        BlockPos feet = bot.blockPosition();
+        BlockPos frontFeet = feet.relative(dir);
+        BlockPos frontHead = frontFeet.above();
+        int dy = depositPos.getY() - feet.getY();
+
+        if (dy >= 2) {
+            digFailReason = "склад выше меня — вверх прокапываться не умею";
+            return null;
+        }
+
+        List<BlockPos> cells = new ArrayList<>();
+        if (dy <= -2
+                && level().getBlockState(frontFeet).isAir()
+                && level().getBlockState(frontHead).isAir()) {
+            // впереди пусто, а склад ниже — ломаем пол перед собой, получается ступенька вниз
+            if (!addDigCell(cells, frontFeet.below())) return null;
+        } else {
+            if (!addDigCell(cells, frontFeet)) return null;
+            if (!addDigCell(cells, frontHead)) return null;
+        }
+        return cells;
+    }
+
+    /** @return false, если ячейку ломать нельзя/опасно (причина в digFailReason). */
+    private boolean addDigCell(List<BlockPos> cells, BlockPos cell) {
+        BlockState state = level().getBlockState(cell);
+        if (state.isAir()) return true; // ломать нечего
+        if (!state.getFluidState().isEmpty()) {
+            if (state.getFluidState().is(FluidTags.LAVA)) {
+                digFailReason = "впереди лава";
+                return false;
+            }
+            return true; // вода — просто идём сквозь неё
+        }
+        if (cell.equals(depositPos)) {
+            digFailReason = "вплотную у склада, но не достать — подведи меня ближе";
+            return false;
+        }
+        if (state.getDestroySpeed(level(), cell) < 0.0F) {
+            digFailReason = "неломаемый блок (" + state.getBlock().getName().getString() + ")";
+            return false;
+        }
+        // лава в любой соседней ячейке — вскрывать нельзя, вольётся в туннель
+        for (Direction d : Direction.values()) {
+            if (level().getFluidState(cell.relative(d)).is(FluidTags.LAVA)) {
+                digFailReason = "рядом лава — вскрывать стену не буду";
+                return false;
+            }
+        }
+        cells.add(cell);
         return true;
     }
 
@@ -330,6 +452,7 @@ public final class BotBrain {
             inv.setItem(i, left == 0 ? ItemStack.EMPTY : remainder);
         }
         container.setChanged();
+        dugThisTrip = 0;
         if (moved > 0) {
             tell("§7[бот] разгрузился в склад (предметов: " + moved + ")");
         } else {
