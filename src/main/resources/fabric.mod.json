@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "schematic-gatherer",
+  "version": "${version}",
+  "name": "SchematicGatherer",
+  "description": "Аддон к Baritone: указываешь схематику — бот сам собирает все ресурсы через #mine.",
+  "authors": ["Bifyp"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.bifyp.schematicgatherer.SchematicGathererMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.0",
+    "fabric-api": "*",
+    "minecraft": "~26.1",
+    "java": ">=25"
+  },
+  "suggests": {
+    "baritone": "*"
+  }
+}

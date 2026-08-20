@@ -1,0 +1,40 @@
+plugins {
+    id 'java'
+    // Если эта версия не резолвится — возьми актуальную с https://fabricmc.net/develop/template/
+    id 'fabric-loom' version '1.11-SNAPSHOT'
+}
+
+base {
+    archivesName = project.archives_base_name
+}
+version = project.mod_version
+group = project.maven_group
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings loom.officialMojangMappings()
+
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    // '+' = последняя Fabric API; при проблемах зафиксируй конкретную версию в gradle.properties
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Baritone API: положи jar в libs/baritone-fabric.jar (см. README, шаг 2 сборки)
+    compileOnly files("libs/baritone-fabric.jar")
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.encoding = "UTF-8"
+    it.options.release = 25
+}
