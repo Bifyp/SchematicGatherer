@@ -12,6 +12,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.Item;
@@ -27,6 +28,7 @@ import java.io.InputStream;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,15 +41,17 @@ import java.util.Optional;
  * следим за инвентарём → переходим к следующей. Если #mine завершился,
  * а предметов всё ещё не хватает — один повтор, потом позиция уходит в «не удалось».
  *
- * Склад (depositPos, задаётся «#gather deposit ...»). Разгрузка случается:
- *  - когда инвентарь полностью заполнен во время сбора;
- *  - после завершения сбора (если есть что нести);
- *  - по команде «#gather deposit now» — в любой момент, даже без задачи.
+ * Улучшения поведения (0.5.0):
+ *  - следующая цель выбирается по БЛИЗОСТИ (один проход по локальному объёму),
+ *    а не тупо по количеству — меньше беготни через всю шахту туда-сюда;
+ *  - после каждой цели подбирается валяющийся рядом дроп этого ресурса;
+ *  - repack() не чаще раза в 5 секунд (не тупит между целями);
+ *  - при старте включается настройка mineScanDroppedItems (подбор дропа во время майна).
  *
- * Дорогу к складу строит Baritone (GoalGetToBlock): при необходимости он сам
- * прокапывается через блоки (allowBreak по умолчанию включён). Разгрузка —
- * правый клик по контейнеру и QUICK_MOVE по слотам; инструмент в активном
- * слоте не трогаем. После разгрузки сбор продолжается с текущей цели.
+ * Склад (depositPos, задаётся «#gather deposit ...»). Разгрузка: при полном
+ * инвентаре, после завершения сбора, по команде «deposit now». Путь строит
+ * Baritone (GoalGetToBlock) — при необходимости прокапывается сам. После
+ * разгрузки сбор продолжается с текущей цели.
  */
 public final class GatherProcess implements Helper {
 
@@ -82,6 +86,15 @@ public final class GatherProcess implements Helper {
     /** Ждём открытия контейнера после правого клика. */
     private static final int OPEN_TIMEOUT = 20;
     private static final int DUMP_PER_TICK = 9;
+    /** Радиус поиска валяющегося дропа после цели. */
+    private static final int PICKUP_RADIUS = 16;
+    /** Радиус «локального» сканирования при выборе ближайшей цели. */
+    private static final int LOCAL_SCAN_RADIUS = 32;
+    private static final int LOCAL_SCAN_VERTICAL = 12;
+    /** repack() не чаще, чем раз в столько тиков (5 секунд). */
+    private static final int REPACK_COOLDOWN = 100;
+    /** Сколько тиков максимум подбираем дроп после цели. */
+    private static final int CLEANUP_TIMEOUT = 200;
 
     private final Deque<Task> queue = new ArrayDeque<>();
     private final List<String> failed = new ArrayList<>();
@@ -100,6 +113,14 @@ public final class GatherProcess implements Helper {
     private int openTicks;
     private int openRetries;
     private int dumpStuckTicks;
+
+    // подбор дропа после цели
+    private boolean cleanupSweep;
+    private Item cleanupItem;
+    private ItemEntity cleanupEntity;
+    private int cleanupTicks;
+    private int cleanupRetries;
+    private long lastRepackTick = Long.MIN_VALUE;
 
     // ---------- команды ----------
 
@@ -135,6 +156,10 @@ public final class GatherProcess implements Helper {
         schematicName = parsed.name();
         warnedFull = false;
         chestUnreachable = false;
+        cleanupSweep = false;
+        cleanupEntity = null;
+        // подбирать валяющийся дроп нужного типа прямо во время майна
+        BaritoneAPI.getSettings().mineScanDroppedItems.value = true;
 
         logDirect("Схематика «" + schematicName + "»: позиций " + parsed.tasks().size() + ", предметов ~" + parsed.totalItems()
                 + (depositPos == null ? "" : ", склад: " + depositPos.toShortString()));
@@ -156,10 +181,12 @@ public final class GatherProcess implements Helper {
     public void cancel() {
         Minecraft mc = Minecraft.getInstance();
         IBaritone baritone = BaritoneAPI.getProvider().getPrimaryBaritone();
-        boolean wasDepositing = depositStage != DepositStage.IDLE || depositRequested;
-        if (wasDepositing) {
-            depositStage = DepositStage.IDLE;
-            depositRequested = false;
+        boolean wasBusy = depositStage != DepositStage.IDLE || depositRequested || cleanupSweep;
+        depositStage = DepositStage.IDLE;
+        depositRequested = false;
+        cleanupSweep = false;
+        cleanupEntity = null;
+        if (wasBusy) {
             if (baritone != null) {
                 baritone.getCustomGoalProcess().onLostControl();
             }
@@ -168,7 +195,7 @@ public final class GatherProcess implements Helper {
             }
         }
         if (!running) {
-            logDirect(wasDepositing ? "Разгрузка остановлена." : "Сбор не запущен.");
+            logDirect(wasBusy ? "Остановлено." : "Сбор не запущен.");
             return;
         }
         if (baritone != null) {
@@ -183,6 +210,10 @@ public final class GatherProcess implements Helper {
     public void printStatus() {
         if (depositStage != DepositStage.IDLE) {
             logDirect("Иду разгружаться на склад " + (depositPos == null ? "?" : depositPos.toShortString()));
+            return;
+        }
+        if (cleanupSweep) {
+            logDirect("Подбираю дроп: " + itemName(cleanupItem));
             return;
         }
         if (!running) {
@@ -247,6 +278,12 @@ public final class GatherProcess implements Helper {
             return;
         }
 
+        // подбор дропа после завершённой цели
+        if (cleanupSweep) {
+            cleanupTick(mc, baritone);
+            return;
+        }
+
         if (!running) return;
 
         if (current == null) {
@@ -254,13 +291,14 @@ public final class GatherProcess implements Helper {
                 finish();
                 return;
             }
-            beginNext(baritone);
+            beginNext(mc, baritone);
             return;
         }
 
         int have = count(current.countItem);
         if (have >= current.totalNeeded) {
             logDirect("✔ " + current.label + " — есть " + have);
+            startCleanupSweep(baritone, current.countItem);
             current = null;
             return;
         }
@@ -290,7 +328,7 @@ public final class GatherProcess implements Helper {
             current.retried = true;
             int remaining = current.totalNeeded - have;
             logDirect("…повторная попытка: " + current.label + " (осталось " + remaining + ")");
-            BaritoneAPI.getProvider().getWorldScanner().repack(baritone.getPlayerContext());
+            repackThrottled(mc, baritone);
             baritone.getMineProcess().mine(remaining, current.mineBlock);
         } else if (current.quietTicks > 60) {
             failed.add(current.label + " — добыто " + have + " из " + current.totalNeeded);
@@ -299,8 +337,9 @@ public final class GatherProcess implements Helper {
         }
     }
 
-    private void beginNext(IBaritone baritone) {
-        current = queue.poll();
+    private void beginNext(Minecraft mc, IBaritone baritone) {
+        current = pollNearest(mc);
+        if (current == null) return;
         current.haveAtStart = count(current.countItem);
         int remaining = current.totalNeeded - current.haveAtStart;
         if (remaining <= 0) {
@@ -309,8 +348,48 @@ public final class GatherProcess implements Helper {
         }
         logDirect("⛏ " + current.label + ": добываю " + remaining
                 + (current.note.isEmpty() ? "" : " (" + current.note + ")"));
-        BaritoneAPI.getProvider().getWorldScanner().repack(baritone.getPlayerContext());
+        repackThrottled(mc, baritone);
         baritone.getMineProcess().mine(remaining, current.mineBlock);
+    }
+
+    /**
+     * Выбирает из очереди цель с ближайшим известным блоком — одним проходом по
+     * локальному объёму вокруг игрока. Если рядом ничего из списка нет,
+     * берётся следующая по старому порядку (по убыванию количества).
+     */
+    private Task pollNearest(Minecraft mc) {
+        if (queue.size() <= 1) return queue.poll();
+        Map<Block, Task> byBlock = new HashMap<>();
+        for (Task t : queue) byBlock.putIfAbsent(t.mineBlock, t);
+        if (byBlock.size() <= 1) return queue.poll();
+
+        Map<Task, Double> nearest = new HashMap<>();
+        BlockPos center = mc.player.blockPosition();
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int dy = -LOCAL_SCAN_VERTICAL; dy <= LOCAL_SCAN_VERTICAL; dy++) {
+            for (int dx = -LOCAL_SCAN_RADIUS; dx <= LOCAL_SCAN_RADIUS; dx++) {
+                for (int dz = -LOCAL_SCAN_RADIUS; dz <= LOCAL_SCAN_RADIUS; dz++) {
+                    pos.set(center.getX() + dx, center.getY() + dy, center.getZ() + dz);
+                    if (!mc.level.hasChunkAt(pos)) continue;
+                    Task t = byBlock.get(mc.level.getBlockState(pos).getBlock());
+                    if (t == null) continue;
+                    double d = pos.distSqr(center);
+                    Double cur = nearest.get(t);
+                    if (cur == null || d < cur) nearest.put(t, d);
+                }
+            }
+        }
+        Task best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (Map.Entry<Task, Double> e : nearest.entrySet()) {
+            if (e.getValue() < bestDist) {
+                bestDist = e.getValue();
+                best = e.getKey();
+            }
+        }
+        if (best == null) return queue.poll();
+        queue.remove(best);
+        return best;
     }
 
     private void finish() {
@@ -327,6 +406,75 @@ public final class GatherProcess implements Helper {
         if (goDeposit) {
             depositRequested = true;
         }
+    }
+
+    // ---------- подбор дропа после цели ----------
+
+    private void startCleanupSweep(IBaritone baritone, Item item) {
+        cleanupSweep = true;
+        cleanupItem = item;
+        cleanupEntity = null;
+        cleanupTicks = 0;
+        cleanupRetries = 0;
+        baritone.getMineProcess().cancel();
+    }
+
+    private void cleanupTick(Minecraft mc, IBaritone baritone) {
+        if (cleanupEntity != null && cleanupEntity.isRemoved()) {
+            cleanupEntity = null; // подобрали или деспавнулся
+            cleanupRetries = 0;
+        }
+        if (cleanupEntity == null) {
+            cleanupEntity = findNearestDrop(mc, cleanupItem);
+            if (cleanupEntity == null) {
+                endCleanupSweep(baritone);
+                return;
+            }
+            baritone.getCustomGoalProcess().setGoalAndPath(new GoalGetToBlock(cleanupEntity.blockPosition()));
+        } else if (!baritone.getCustomGoalProcess().isActive()) {
+            if (cleanupEntity.distanceTo(mc.player) < 3.0) {
+                // уже стоим рядом — просто ждём, пока всосёт (у свежего дропа pickup delay)
+            } else if (++cleanupRetries > 2) {
+                endCleanupSweep(baritone); // недостижимый дроп (лава/пропасть) — не зацикливаемся
+                return;
+            } else {
+                baritone.getCustomGoalProcess().setGoalAndPath(new GoalGetToBlock(cleanupEntity.blockPosition()));
+            }
+        }
+        if (++cleanupTicks > CLEANUP_TIMEOUT) {
+            endCleanupSweep(baritone);
+        }
+    }
+
+    private void endCleanupSweep(IBaritone baritone) {
+        cleanupSweep = false;
+        cleanupEntity = null;
+        cleanupTicks = 0;
+        cleanupRetries = 0;
+        baritone.getCustomGoalProcess().onLostControl();
+    }
+
+    private static ItemEntity findNearestDrop(Minecraft mc, Item item) {
+        List<ItemEntity> drops = mc.level.getEntitiesOfClass(ItemEntity.class,
+                mc.player.getBoundingBox().inflate(PICKUP_RADIUS, 8.0, PICKUP_RADIUS),
+                e -> e.getItem().is(item));
+        ItemEntity best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (ItemEntity e : drops) {
+            double d = e.distanceToSqr(mc.player);
+            if (d < bestDist) {
+                bestDist = d;
+                best = e;
+            }
+        }
+        return best;
+    }
+
+    private void repackThrottled(Minecraft mc, IBaritone baritone) {
+        long now = mc.level.getGameTime();
+        if (now - lastRepackTick < REPACK_COOLDOWN) return;
+        lastRepackTick = now;
+        BaritoneAPI.getProvider().getWorldScanner().repack(baritone.getPlayerContext());
     }
 
     // ---------- склад: путь, открытие, разгрузка ----------
@@ -441,7 +589,7 @@ public final class GatherProcess implements Helper {
     private void endDeposit(Minecraft mc, IBaritone baritone, String message) {
         logDirect(message);
         cleanupDeposit(mc, baritone);
-        resumeGather(baritone);
+        resumeGather(mc, baritone);
     }
 
     private void failDeposit(Minecraft mc, IBaritone baritone, String reason) {
@@ -449,7 +597,7 @@ public final class GatherProcess implements Helper {
                 + ". Склад отключён до перезадачи (#gather deposit here/set).", ChatFormatting.RED);
         chestUnreachable = true;
         cleanupDeposit(mc, baritone);
-        resumeGather(baritone);
+        resumeGather(mc, baritone);
     }
 
     private void cleanupDeposit(Minecraft mc, IBaritone baritone) {
@@ -462,13 +610,13 @@ public final class GatherProcess implements Helper {
     }
 
     /** После разгрузки продолжаем прерванную цель. */
-    private void resumeGather(IBaritone baritone) {
+    private void resumeGather(Minecraft mc, IBaritone baritone) {
         if (!running || current == null) return;
         int remaining = current.totalNeeded - count(current.countItem);
         if (remaining <= 0) return; // следующий тик сам закроет цель
         current.quietTicks = 0;
         logDirect("Продолжаю: " + current.label + " (осталось " + remaining + ")");
-        BaritoneAPI.getProvider().getWorldScanner().repack(baritone.getPlayerContext());
+        repackThrottled(mc, baritone);
         baritone.getMineProcess().mine(remaining, current.mineBlock);
     }
 
