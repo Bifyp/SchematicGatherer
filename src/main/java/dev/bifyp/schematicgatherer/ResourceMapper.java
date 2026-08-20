@@ -1,7 +1,7 @@
 package dev.bifyp.schematicgatherer;
 
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
@@ -159,13 +159,22 @@ public final class ResourceMapper {
         return null;
     }
 
+    /** В 26.1 ResourceLocation переименован в Identifier (net.minecraft.resources.Identifier). */
+    private static Identifier id(String path) {
+        return Identifier.tryParse(path.contains(":") ? path : "minecraft:" + path);
+    }
+
     private static Block byPath(String path) {
-        Block b = BuiltInRegistries.BLOCK.getValue(ResourceLocation.fromNamespaceAndPath("minecraft", path));
-        return b == Blocks.AIR ? null : b;
+        Identifier key = id(path);
+        if (key == null) return null;
+        Block b = BuiltInRegistries.BLOCK.getOptional(key).orElse(null);
+        return b == null || b == Blocks.AIR ? null : b;
     }
 
     private static Item itemByPath(String path) {
-        Item i = BuiltInRegistries.ITEM.getValue(ResourceLocation.fromNamespaceAndPath("minecraft", path));
-        return i == Items.AIR ? null : i;
+        Identifier key = id(path);
+        if (key == null) return null;
+        Item i = BuiltInRegistries.ITEM.getOptional(key).orElse(null);
+        return i == null || i == Items.AIR ? null : i;
     }
 }
