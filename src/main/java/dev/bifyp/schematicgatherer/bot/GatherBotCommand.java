@@ -19,6 +19,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.Container;
+import net.minecraft.world.SimpleMenuProvider;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
@@ -48,6 +49,7 @@ public final class GatherBotCommand {
     private static final double DEPOSIT_RAYCAST = 6.0;
     private static final int DEFAULT_COLLECT_AMOUNT = 64;
     private static final int DEFAULT_BRING_AMOUNT = 64;
+    private static final int DEFAULT_SCAN_RADIUS = 32;
 
     private GatherBotCommand() {}
 
@@ -62,11 +64,14 @@ public final class GatherBotCommand {
                                         .then(argument("position", Vec3Argument.vec3())
                                                 .executes(c -> spawn(c, Vec3Argument.getVec3(c, "position")))))))
                 .then(argument("bot", StringArgumentType.word())
+                        .then(literal("gui").executes(GatherBotCommand::gui))
                         .then(literal("kill").executes(GatherBotCommand::kill))
                         .then(literal("stop").executes(GatherBotCommand::stop))
                         .then(literal("pause").executes(GatherBotCommand::pause))
                         .then(literal("resume").executes(GatherBotCommand::resume))
+                        .then(literal("home").executes(GatherBotCommand::home))
                         .then(literal("status").executes(GatherBotCommand::status))
+                        .then(literal("stats").executes(GatherBotCommand::stats))
                         .then(literal("skip")
                                 .executes(GatherBotCommand::skipCurrent)
                                 .then(argument("item", StringArgumentType.word())
@@ -81,6 +86,19 @@ public final class GatherBotCommand {
                                         .executes(c -> bring(c, DEFAULT_BRING_AMOUNT))
                                         .then(argument("amount", IntegerArgumentType.integer(1, 10000))
                                                 .executes(c -> bring(c, IntegerArgumentType.getInteger(c, "amount"))))))
+                        .then(literal("scan")
+                                .executes(c -> scan(c, DEFAULT_SCAN_RADIUS))
+                                .then(argument("radius", IntegerArgumentType.integer(8, 48))
+                                        .executes(c -> scan(c, IntegerArgumentType.getInteger(c, "radius")))))
+                        .then(literal("smelt").executes(GatherBotCommand::smelt))
+                        .then(literal("transfer").executes(GatherBotCommand::transfer))
+                        .then(literal("quarry").executes(GatherBotCommand::quarry))
+                        .then(literal("stock")
+                                .executes(GatherBotCommand::stockList)
+                                .then(literal("clear").executes(GatherBotCommand::stockClear))
+                                .then(argument("block", StringArgumentType.word())
+                                        .then(argument("min", IntegerArgumentType.integer(1, 100000))
+                                                .executes(GatherBotCommand::stockSet))))
                         .then(literal("protect")
                                 .executes(GatherBotCommand::protectInfo)
                                 .then(literal("off").executes(GatherBotCommand::protectOff))
@@ -121,7 +139,7 @@ public final class GatherBotCommand {
         GatherBot.spawn(name, server, level, pos, rot.y, rot.x);
         BotPersistence.save(server);
         c.getSource().sendSystemMessage(Component.literal("§a[бот] «" + name + "» заспавнен (неуязвим до kill, переживает рестарт). "
-                + "Выдай кирку, задай склад (deposit here) и команду gather/collect :)"));
+                + "Выдай кирку, задай склад (deposit here) и команду gather/collect. Настройки: gui :)"));
         return 1;
     }
 
@@ -159,10 +177,42 @@ public final class GatherBotCommand {
         return 1;
     }
 
+    private static int home(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        bot.brain.goHome();
+        return 1;
+    }
+
     private static int status(CommandContext<CommandSourceStack> c) {
         GatherBot bot = getBot(c);
         if (bot == null) return 0;
         c.getSource().sendSystemMessage(Component.literal("§7[бот] " + bot.brain.status()));
+        return 1;
+    }
+
+    private static int stats(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        BotBrain b = bot.brain;
+        c.getSource().sendSystemMessage(Component.literal("§7[бот] «" + bot.getGameProfile().name() + "»: сломано блоков "
+                + b.getSessionBlocks() + " (всего " + b.getTotalBlocks() + "), на склад "
+                + b.getSessionDeposited() + " (всего " + b.getTotalDeposited() + ")"));
+        return 1;
+    }
+
+    // ---------- GUI ----------
+
+    private static int gui(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        if (!(c.getSource().getEntity() instanceof ServerPlayer player)) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] GUI доступно только игроку"));
+            return 0;
+        }
+        player.openMenu(new SimpleMenuProvider(
+                (id, inv, p) -> new BotSettingsMenu(id, inv, bot),
+                Component.literal("Настройки: " + bot.getGameProfile().name())));
         return 1;
     }
 
@@ -236,6 +286,127 @@ public final class GatherBotCommand {
         }
         bot.brain.bring(player, item, amount);
         BotPersistence.save(c.getSource().getServer());
+        return 1;
+    }
+
+    // ---------- сканер ----------
+
+    private static int scan(CommandContext<CommandSourceStack> c, int radius) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        ServerLevel level = (ServerLevel) bot.level();
+        BlockPos center = bot.blockPosition();
+        Map<String, Integer> counts = new HashMap<>();
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int dy = -12; dy <= 12; dy++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    pos.set(center.getX() + dx, center.getY() + dy, center.getZ() + dz);
+                    if (!level.hasChunkAt(pos)) continue;
+                    BlockState state = level.getBlockState(pos);
+                    if (state.isAir() || !state.getFluidState().isEmpty()) continue;
+                    counts.merge(BuiltInRegistries.BLOCK.getKey(state.getBlock()).getPath(), 1, Integer::sum);
+                }
+            }
+        }
+        c.getSource().sendSystemMessage(Component.literal("§7[бот] вокруг «" + bot.getGameProfile().name() + "» (радиус " + radius + "):"));
+        counts.entrySet().stream()
+                .sorted((a, b) -> Integer.compare(b.getValue(), a.getValue()))
+                .limit(12)
+                .forEach(e -> c.getSource().sendSystemMessage(Component.literal("§7 - " + e.getKey() + " ×" + e.getValue())));
+        return 1;
+    }
+
+    // ---------- печки ----------
+
+    private static int smelt(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        if (bot.brain.getDeposit() == null) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] склад не задан — печки ищутся рядом с ним"));
+            return 0;
+        }
+        int acted = bot.brain.smeltPass();
+        c.getSource().sendSystemMessage(Component.literal(acted == 0
+                ? "§7[бот] печек рядом со складом нет или обслуживать нечего"
+                : "§a[бот] печки обслужены (действий: " + acted + ")"));
+        return 1;
+    }
+
+    // ---------- перенос склада ----------
+
+    private static int transfer(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        bot.brain.transferFrom(bot.blockPosition());
+        return 1;
+    }
+
+    // ---------- карьер ----------
+
+    private static int quarry(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        if (bot.brain.isRunning()) {
+            c.getSource().sendSystemMessage(Component.literal("§e[бот] уже занят. Сначала: /gatherbot " + bot.getGameProfile().name() + " stop"));
+            return 0;
+        }
+        if (bot.brain.getRegionA() == null || bot.brain.getRegionB() == null) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] сначала задай зону: region pos1 / region pos2 (встань на углы)"));
+            return 0;
+        }
+        UUID owner = c.getSource().getEntity() instanceof ServerPlayer p ? p.getUUID() : null;
+        bot.brain.startQuarry(owner);
+        BotPersistence.save(c.getSource().getServer());
+        return 1;
+    }
+
+    // ---------- сток-уровни ----------
+
+    private static int stockList(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        var rules = bot.brain.getStockRules();
+        if (rules.isEmpty()) {
+            c.getSource().sendSystemMessage(Component.literal("§7[бот] сток-правил нет. Добавь: stock <блок> <минимум>"));
+            return 1;
+        }
+        c.getSource().sendSystemMessage(Component.literal("§7[бот] сток-уровни:"));
+        rules.forEach(r -> c.getSource().sendSystemMessage(Component.literal("§7 - "
+                + BuiltInRegistries.ITEM.getKey(r.item()).getPath() + " мин. " + r.min()
+                + " (добываю " + BuiltInRegistries.BLOCK.getKey(r.block()).getPath() + ")")));
+        return 1;
+    }
+
+    private static int stockClear(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        bot.brain.clearStockRules();
+        BotPersistence.save(c.getSource().getServer());
+        c.getSource().sendSystemMessage(Component.literal("§e[бот] сток-правила сброшены"));
+        return 1;
+    }
+
+    private static int stockSet(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        String id = StringArgumentType.getString(c, "block");
+        int min = IntegerArgumentType.getInteger(c, "min");
+        Identifier identifier = Identifier.tryParse(id);
+        Block block = identifier == null ? null : BuiltInRegistries.BLOCK.getOptional(identifier).orElse(null);
+        if (block == null || block == Blocks.AIR) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] не знаю блок «" + id + "»"));
+            return 0;
+        }
+        Optional<ResourceMapper.Target> mapped = ResourceMapper.map(block, min);
+        if (mapped.isEmpty()) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] «" + id + "» недобываем — сток не добавлен"));
+            return 0;
+        }
+        bot.brain.addStockRule(block, mapped.get().item(), min);
+        BotPersistence.save(c.getSource().getServer());
+        c.getSource().sendSystemMessage(Component.literal("§a[бот] сток: «" + BuiltInRegistries.ITEM.getKey(mapped.get().item()).getPath()
+                + "» мин. " + min + " — просядет ниже, сам еду добывать"));
         return 1;
     }
 
