@@ -14,6 +14,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.item.crafting.SingleRecipeInput;
 import net.minecraft.world.level.block.Block;
@@ -30,12 +31,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Predicate;
 
 /**
- * Серверный «мозг» бота: очередь «что добыть» → поиск ближайшего блока →
- * подойти → сломать → пока не хватит.
+ * Серверный «мозг» бота: очередь «что добыть» -> поиск ближайшего блока ->
+ * подойти -> сломать -> пока не хватит.
  *
  * Склад — двусторонний, с телепортом (выключаемо) и самосортировкой.
  * Доп. режимы: quarry (выкапывает всё внутри region), scan, transfer, bring.
@@ -57,6 +59,8 @@ public final class BotBrain {
     private static final long MAX_QUARRY_VOLUME = 128000;
     private static final int RESTOCK_INTERVAL = 600; // 30 секунд
     private static final int SMELT_INTERVAL = 400;   // 20 секунд
+    /** Слотов основного инвентаря игрока (без брони и второй руки). */
+    private static final int PLAYER_MAIN_SLOTS = 36;
 
     /** Правило сток-уровня: держать на складе минимум min предметов item (добывается block). */
     public record StockRule(Block block, Item item, int min) {}
@@ -138,7 +142,7 @@ public final class BotBrain {
     public boolean isAutoHome() { return autoHome; }
     public void setAutoHome(boolean v) { autoHome = v; }
 
-    /** Переключение из chest-GUI (BotSettingsMenu): слот → настройка. */
+    /** Переключение из chest-GUI (BotSettingsMenu): слот -> настройка. */
     public void toggleSetting(int slot) {
         switch (slot) {
             case 10 -> teleportEnabled = !teleportEnabled;
@@ -362,10 +366,46 @@ public final class BotBrain {
         while (count > 0) {
             int n = Math.min(count, max);
             ItemStack stack = new ItemStack(item, n);
-            player.getInventory().addItem(stack);
+            insertInto(player.getInventory(), stack);
             if (!stack.isEmpty()) player.drop(stack, false);
             count -= n;
         }
+    }
+
+    /**
+     * Кладёт стак в контейнер вручную: сначала докладываем в частичные стаки, потом в пустые слоты.
+     * В 26.1 у Inventory больше нет addItem(ItemStack), а Container-методы стабильны.
+     * Переданный стак уменьшается на положенное количество (остаток = что не влезло).
+     */
+    private static void insertInto(Container inv, ItemStack stack) {
+        if (stack.isEmpty()) return;
+        // у инвентаря игрока за 36 слотами идут броня и вторая рука — туда не лезем
+        int size = inv instanceof Inventory ? Math.min(inv.getContainerSize(), PLAYER_MAIN_SLOTS) : inv.getContainerSize();
+        for (int i = 0; i < size && !stack.isEmpty(); i++) {
+            ItemStack slot = inv.getItem(i);
+            if (slot.isEmpty() || !ItemStack.isSameItemSameComponents(slot, stack)) continue;
+            int room = Math.min(slot.getMaxStackSize(), inv.getMaxStackSize()) - slot.getCount();
+            if (room <= 0) continue;
+            int move = Math.min(room, stack.getCount());
+            slot.grow(move);
+            stack.shrink(move);
+        }
+        for (int i = 0; i < size && !stack.isEmpty(); i++) {
+            if (!inv.getItem(i).isEmpty()) continue;
+            int move = Math.min(Math.min(stack.getMaxStackSize(), inv.getMaxStackSize()), stack.getCount());
+            ItemStack put = stack.copy();
+            put.setCount(move);
+            inv.setItem(i, put);
+            stack.shrink(move);
+        }
+        inv.setChanged();
+    }
+
+    /** Остаток, который никуда не влез: вернуть в исходный контейнер, в крайнем случае — бросить под ноги. */
+    private void returnLeftover(Container source, ItemStack leftover) {
+        if (leftover.isEmpty()) return;
+        insertInto(source, leftover);
+        if (!leftover.isEmpty()) bot.drop(leftover, false);
     }
 
     /** Перенос: всё из контейнеров вокруг указанной точки — на склад (переезд хранилища). */
@@ -672,7 +712,7 @@ public final class BotBrain {
             }
             // топливо
             if (furnace.getItem(1).isEmpty()) {
-                ItemStack fuel = takeByPredicate(AbstractFurnaceBlockEntity::isFuel, 32);
+                ItemStack fuel = takeByPredicate(BotBrain::isFuelItem, 32);
                 if (!fuel.isEmpty()) {
                     furnace.setItem(1, fuel);
                     furnace.setChanged();
@@ -682,6 +722,19 @@ public final class BotBrain {
         }
         if (teleportEnabled) teleportBack(back);
         return acted;
+    }
+
+    /**
+     * Топливо для печек — намеренно узкий список: уголь, древесный уголь, блок угля,
+     * сушёная ламинария, стержень ифрита. Доски и брёвна не жжём: это стройматериал,
+     * который бот сам и добывал.
+     */
+    private static boolean isFuelItem(ItemStack stack) {
+        return stack.is(Items.COAL)
+                || stack.is(Items.CHARCOAL)
+                || stack.is(Items.COAL_BLOCK)
+                || stack.is(Items.DRIED_KELP_BLOCK)
+                || stack.is(Items.BLAZE_ROD);
     }
 
     private boolean isSmeltable(ItemStack stack) {
@@ -807,12 +860,13 @@ public final class BotBrain {
                 if (remaining == null || remaining <= 0) continue;
                 int take = Math.min(stack.getCount(), remaining);
                 ItemStack taken = container.removeItem(i, take);
+                Item takenItem = taken.getItem();
                 int before = taken.getCount();
-                bot.getInventory().addItem(taken);
+                insertInto(bot.getInventory(), taken);
                 int used = before - taken.getCount();
-                if (taken.getCount() > 0) container.setItem(i, taken);
+                returnLeftover(container, taken);
                 if (used > 0) {
-                    need.merge(stack.getItem(), -used, Integer::sum);
+                    need.merge(takenItem, -used, Integer::sum);
                     took += used;
                 }
                 container.setChanged();
@@ -845,12 +899,10 @@ public final class BotBrain {
                 if (stack.isEmpty() || stack.getDestroySpeed(state) <= 1.0F) continue;
                 ItemStack taken = container.removeItem(i, 1);
                 int before = taken.getCount();
-                bot.getInventory().addItem(taken);
-                if (taken.getCount() > 0) container.setItem(i, taken);
-                if (taken.getCount() < before) {
-                    container.setChanged();
-                    found = true;
-                }
+                insertInto(bot.getInventory(), taken);
+                if (taken.getCount() < before) found = true;
+                returnLeftover(container, taken);
+                container.setChanged();
                 break outer;
             }
         }
