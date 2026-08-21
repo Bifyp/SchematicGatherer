@@ -24,8 +24,8 @@ import java.io.Reader;
 import java.io.Writer;
 
 /**
- * schematic-gatherer-bots.json в корне запуска: боты и их склады переживают рестарт.
- * Сохраняем при спавне/kill/смене склада и на SERVER_STOPPING,
+ * schematic-gatherer-bots.json в корне запуска: боты и их настройки переживают рестарт.
+ * Сохраняем при спавне/kill/смене склада/зоны/защиты и на SERVER_STOPPING,
  * поднимаем на SERVER_STARTED.
  */
 public final class BotPersistence {
@@ -50,6 +50,13 @@ public final class BotPersistence {
             BlockPos dep = bot.brain.getDeposit();
             if (dep != null) {
                 o.addProperty("deposit", dep.getX() + "," + dep.getY() + "," + dep.getZ());
+            }
+            o.addProperty("protect", bot.brain.getProtectRadius());
+            BlockPos a = bot.brain.getRegionA();
+            BlockPos b = bot.brain.getRegionB();
+            if (a != null && b != null) {
+                o.addProperty("region", a.getX() + "," + a.getY() + "," + a.getZ() + ";"
+                        + b.getX() + "," + b.getY() + "," + b.getZ());
             }
             arr.add(o);
         }
@@ -80,10 +87,16 @@ public final class BotPersistence {
                         new Vec3(o.get("x").getAsDouble(), o.get("y").getAsDouble(), o.get("z").getAsDouble()),
                         o.get("yaw").getAsFloat(), o.get("pitch").getAsFloat());
                 if (o.has("deposit")) {
-                    String[] parts = o.get("deposit").getAsString().split(",");
-                    if (parts.length == 3) {
-                        bot.brain.setDeposit(new BlockPos(
-                                Integer.parseInt(parts[0]), Integer.parseInt(parts[1]), Integer.parseInt(parts[2])));
+                    bot.brain.setDeposit(parsePos(o.get("deposit").getAsString()));
+                }
+                if (o.has("protect")) {
+                    bot.brain.setProtectRadius(o.get("protect").getAsInt());
+                }
+                if (o.has("region")) {
+                    String[] two = o.get("region").getAsString().split(";");
+                    if (two.length == 2) {
+                        bot.brain.setRegionA(parsePos(two[0]));
+                        bot.brain.setRegionB(parsePos(two[1]));
                     }
                 }
             } catch (Exception ignored) {
@@ -92,12 +105,15 @@ public final class BotPersistence {
         }
     }
 
+    private static BlockPos parsePos(String s) {
+        String[] parts = s.split(",");
+        return new BlockPos(Integer.parseInt(parts[0]), Integer.parseInt(parts[1]), Integer.parseInt(parts[2]));
+    }
+
     /** Без обращения к переименованным в 26.1 методам ResourceKey — покрываем ванильные измерения. */
     private static String dimId(ServerLevel level) {
-        MinecraftServer server = level.getServer();
         if (level.getServer().getLevel(Level.NETHER) == level) return "minecraft:nether";
         if (level.getServer().getLevel(Level.END) == level) return "minecraft:the_end";
-        if (server.overworld() == level) return "minecraft:overworld";
         return "minecraft:overworld";
     }
 }

@@ -19,6 +19,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.Container;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -46,6 +47,7 @@ public final class GatherBotCommand {
     private static final int DEFAULT_RADIUS = 48;
     private static final double DEPOSIT_RAYCAST = 6.0;
     private static final int DEFAULT_COLLECT_AMOUNT = 64;
+    private static final int DEFAULT_BRING_AMOUNT = 64;
 
     private GatherBotCommand() {}
 
@@ -74,6 +76,21 @@ public final class GatherBotCommand {
                                         .executes(c -> collect(c, DEFAULT_COLLECT_AMOUNT))
                                         .then(argument("amount", IntegerArgumentType.integer(1, 100000))
                                                 .executes(c -> collect(c, IntegerArgumentType.getInteger(c, "amount"))))))
+                        .then(literal("bring")
+                                .then(argument("item", StringArgumentType.word())
+                                        .executes(c -> bring(c, DEFAULT_BRING_AMOUNT))
+                                        .then(argument("amount", IntegerArgumentType.integer(1, 10000))
+                                                .executes(c -> bring(c, IntegerArgumentType.getInteger(c, "amount"))))))
+                        .then(literal("protect")
+                                .executes(GatherBotCommand::protectInfo)
+                                .then(literal("off").executes(GatherBotCommand::protectOff))
+                                .then(argument("radius", IntegerArgumentType.integer(1, 64))
+                                        .executes(GatherBotCommand::protectSet)))
+                        .then(literal("region")
+                                .executes(GatherBotCommand::regionInfo)
+                                .then(literal("pos1").executes(GatherBotCommand::regionPos1))
+                                .then(literal("pos2").executes(GatherBotCommand::regionPos2))
+                                .then(literal("clear").executes(GatherBotCommand::regionClear)))
                         .then(literal("list")
                                 .then(argument("schematic", StringArgumentType.word())
                                         .executes(GatherBotCommand::list)))
@@ -201,6 +218,102 @@ public final class GatherBotCommand {
         return 1;
     }
 
+    // ---------- курьер ----------
+
+    private static int bring(CommandContext<CommandSourceStack> c, int amount) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        if (!(c.getSource().getEntity() instanceof ServerPlayer player)) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] «bring» может использовать только игрок"));
+            return 0;
+        }
+        String id = StringArgumentType.getString(c, "item");
+        Identifier identifier = Identifier.tryParse(id);
+        Item item = identifier == null ? null : BuiltInRegistries.ITEM.getOptional(identifier).orElse(null);
+        if (item == null || item == Items.AIR) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] не знаю предмет «" + id + "» (пример: cobblestone, torch)"));
+            return 0;
+        }
+        bot.brain.bring(player, item, amount);
+        BotPersistence.save(c.getSource().getServer());
+        return 1;
+    }
+
+    // ---------- безопасность базы ----------
+
+    private static int protectInfo(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        int r = bot.brain.getProtectRadius();
+        c.getSource().sendSystemMessage(Component.literal(r == 0
+                ? "§7[бот] защитный радиус выключен — копаю где угодно"
+                : "§7[бот] защитный радиус: " + r + " блоков от склада (базу не копаю)"));
+        return 1;
+    }
+
+    private static int protectOff(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        bot.brain.setProtectRadius(0);
+        BotPersistence.save(c.getSource().getServer());
+        c.getSource().sendSystemMessage(Component.literal("§e[бот] защитный радиус выключен"));
+        return 1;
+    }
+
+    private static int protectSet(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        int r = IntegerArgumentType.getInteger(c, "radius");
+        bot.brain.setProtectRadius(r);
+        BotPersistence.save(c.getSource().getServer());
+        c.getSource().sendSystemMessage(Component.literal("§a[бот] защитный радиус: " + r + " блоков от склада"));
+        return 1;
+    }
+
+    private static int regionInfo(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        BlockPos a = bot.brain.getRegionA();
+        BlockPos b = bot.brain.getRegionB();
+        c.getSource().sendSystemMessage(Component.literal(a == null || b == null
+                ? "§7[бот] зона добычи не задана (нужны pos1 и pos2 — встань на углы и вызови)"
+                : "§7[бот] зона добычи: " + a.toShortString() + " .. " + b.toShortString()));
+        return 1;
+    }
+
+    private static int regionPos1(CommandContext<CommandSourceStack> c) {
+        return regionPos(c, true);
+    }
+
+    private static int regionPos2(CommandContext<CommandSourceStack> c) {
+        return regionPos(c, false);
+    }
+
+    private static int regionPos(CommandContext<CommandSourceStack> c, boolean first) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        if (!(c.getSource().getEntity() instanceof ServerPlayer player)) {
+            c.getSource().sendSystemMessage(Component.literal("§c[бот] углы зоны задаёт только игрок (встань на угол)"));
+            return 0;
+        }
+        BlockPos pos = player.blockPosition();
+        if (first) bot.brain.setRegionA(pos); else bot.brain.setRegionB(pos);
+        BotPersistence.save(c.getSource().getServer());
+        c.getSource().sendSystemMessage(Component.literal("§a[бот] угол " + (first ? "pos1" : "pos2") + ": " + pos.toShortString()
+                + (bot.brain.getRegionA() != null && bot.brain.getRegionB() != null
+                ? " — зона задана, копаю только внутри" : " — теперь второй угол")));
+        return 1;
+    }
+
+    private static int regionClear(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        bot.brain.clearRegion();
+        BotPersistence.save(c.getSource().getServer());
+        c.getSource().sendSystemMessage(Component.literal("§e[бот] зона добычи сброшена — копаю где угодно"));
+        return 1;
+    }
+
     // ---------- склад ----------
 
     private static int depositInfo(CommandContext<CommandSourceStack> c) {
@@ -209,7 +322,7 @@ public final class GatherBotCommand {
         BlockPos pos = bot.brain.getDeposit();
         c.getSource().sendSystemMessage(Component.literal(pos == null
                 ? "§7[бот] склад не задан. Задай: deposit here (глядя на сундук) или deposit set <x> <y> <z>. "
-                  + "Работает и с большим складом: контейнеры ищутся в радиусе 8 от якоря."
+                  + "Контейнеры в радиусе 8 от якоря — тоже склад; предметы раскладываются по местам сами."
                 : "§7[бот] склад: " + pos.toShortString() + " (разгрузиться сейчас: deposit now)"));
         return 1;
     }
@@ -255,7 +368,7 @@ public final class GatherBotCommand {
         bot.brain.setDeposit(pos);
         BotPersistence.save(c.getSource().getServer());
         c.getSource().sendSystemMessage(Component.literal("§a[бот] склад для «" + bot.getGameProfile().name() + "»: " + pos.toShortString()
-                + " (контейнеры рядом — тоже склад)"));
+                + " (контейнеры рядом — тоже склад, база в радиусе " + bot.brain.getProtectRadius() + " не копается)"));
         return 1;
     }
 
