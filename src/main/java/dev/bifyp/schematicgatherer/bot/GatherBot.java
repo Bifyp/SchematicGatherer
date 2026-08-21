@@ -1,6 +1,7 @@
 package dev.bifyp.schematicgatherer.bot;
 
 import com.mojang.authlib.GameProfile;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.UUIDUtil;
 import net.minecraft.network.DisconnectionDetails;
 import net.minecraft.network.chat.Component;
@@ -24,8 +25,8 @@ import java.util.Set;
  * Фейковый игрок-сборщик. Спавн повторяет EntityPlayerMPFake из Carpet:
  * офлайн-UUID, FakeClientConnection, placeNewPlayer — для сервера это полноценный игрок.
  *
- * «Бессердечный»: неуязвим от спавна и до команды /gatherbot <имя> kill —
- * мобы, лава, падение и голод его не останавливают.
+ * «Бессердечный»: неуязвим от спавна и до команды /gatherbot <имя> kill
+ * (переключается в GUI: /gatherbot <имя> gui).
  */
 public final class GatherBot extends ServerPlayer {
 
@@ -48,8 +49,10 @@ public final class GatherBot extends ServerPlayer {
         bot.unsetRemoved();
         bot.getAttribute(Attributes.STEP_HEIGHT).setBaseValue(0.6F);
         bot.gameMode.changeGameModeForPlayer(GameType.SURVIVAL);
-        // неуязвим от спавна и до команды kill
+        // неуязвим от спавна и до команды kill (переключается в gui)
         bot.setInvulnerable(true);
+        // дом = точка спавна (команда home / настройка «домой после задачи»)
+        bot.brain.setHome(BlockPos.containing(pos));
         // чтобы другие игроки увидели бота сразу, а не после первого движения
         server.getPlayerList().broadcastAll(
                 new ClientboundRotateHeadPacket(bot, (byte) (bot.yHeadRot * 256 / 360)), level.dimension());

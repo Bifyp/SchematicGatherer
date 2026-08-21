@@ -7,12 +7,15 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 
@@ -24,9 +27,8 @@ import java.io.Reader;
 import java.io.Writer;
 
 /**
- * schematic-gatherer-bots.json в корне запуска: боты и их настройки переживают рестарт.
- * Сохраняем при спавне/kill/смене склада/зоны/защиты и на SERVER_STOPPING,
- * поднимаем на SERVER_STARTED.
+ * schematic-gatherer-bots.json: боты и все их настройки переживают рестарт.
+ * Сохраняем при спавне/kill/смене настроек и на SERVER_STOPPING, поднимаем на SERVER_STARTED.
  */
 public final class BotPersistence {
 
@@ -39,6 +41,7 @@ public final class BotPersistence {
         JsonArray arr = new JsonArray();
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             if (!(p instanceof GatherBot bot)) continue;
+            BotBrain brain = bot.brain;
             JsonObject o = new JsonObject();
             o.addProperty("name", bot.getGameProfile().name());
             o.addProperty("dim", dimId((ServerLevel) bot.level()));
@@ -47,16 +50,39 @@ public final class BotPersistence {
             o.addProperty("z", bot.getZ());
             o.addProperty("yaw", bot.getYRot());
             o.addProperty("pitch", bot.getXRot());
-            BlockPos dep = bot.brain.getDeposit();
-            if (dep != null) {
-                o.addProperty("deposit", dep.getX() + "," + dep.getY() + "," + dep.getZ());
+            if (brain.getDeposit() != null) {
+                BlockPos d = brain.getDeposit();
+                o.addProperty("deposit", d.getX() + "," + d.getY() + "," + d.getZ());
             }
-            o.addProperty("protect", bot.brain.getProtectRadius());
-            BlockPos a = bot.brain.getRegionA();
-            BlockPos b = bot.brain.getRegionB();
-            if (a != null && b != null) {
+            o.addProperty("protect", brain.getProtectRadius());
+            if (brain.getRegionA() != null && brain.getRegionB() != null) {
+                BlockPos a = brain.getRegionA();
+                BlockPos b = brain.getRegionB();
                 o.addProperty("region", a.getX() + "," + a.getY() + "," + a.getZ() + ";"
                         + b.getX() + "," + b.getY() + "," + b.getZ());
+            }
+            if (brain.getHome() != null) {
+                BlockPos h = brain.getHome();
+                o.addProperty("home", h.getX() + "," + h.getY() + "," + h.getZ());
+            }
+            o.addProperty("teleport", brain.isTeleportEnabled());
+            o.addProperty("invuln", brain.isInvulnerable());
+            o.addProperty("quiet", brain.isQuiet());
+            o.addProperty("autoSmelt", brain.isAutoSmelt());
+            o.addProperty("autoRestock", brain.isAutoRestock());
+            o.addProperty("autoHome", brain.isAutoHome());
+            o.addProperty("totalBlocks", brain.getTotalBlocks());
+            o.addProperty("totalDeposited", brain.getTotalDeposited());
+            if (!brain.getStockRules().isEmpty()) {
+                JsonArray stock = new JsonArray();
+                for (BotBrain.StockRule rule : brain.getStockRules()) {
+                    JsonObject s = new JsonObject();
+                    s.addProperty("block", BuiltInRegistries.BLOCK.getKey(rule.block()).toString());
+                    s.addProperty("item", BuiltInRegistries.ITEM.getKey(rule.item()).toString());
+                    s.addProperty("min", rule.min());
+                    stock.add(s);
+                }
+                o.add("stock", stock);
             }
             arr.add(o);
         }
@@ -73,7 +99,7 @@ public final class BotPersistence {
         try (Reader r = new FileReader(FILE)) {
             arr = JsonParser.parseReader(r).getAsJsonArray();
         } catch (Exception e) {
-            return; // битый/пустой файл — просто никого не поднимаем
+            return;
         }
         for (JsonElement el : arr) {
             try {
@@ -86,17 +112,35 @@ public final class BotPersistence {
                 GatherBot bot = GatherBot.spawn(name, server, level,
                         new Vec3(o.get("x").getAsDouble(), o.get("y").getAsDouble(), o.get("z").getAsDouble()),
                         o.get("yaw").getAsFloat(), o.get("pitch").getAsFloat());
-                if (o.has("deposit")) {
-                    bot.brain.setDeposit(parsePos(o.get("deposit").getAsString()));
-                }
-                if (o.has("protect")) {
-                    bot.brain.setProtectRadius(o.get("protect").getAsInt());
-                }
+                BotBrain brain = bot.brain;
+                if (o.has("deposit")) brain.setDeposit(parsePos(o.get("deposit").getAsString()));
+                if (o.has("protect")) brain.setProtectRadius(o.get("protect").getAsInt());
                 if (o.has("region")) {
                     String[] two = o.get("region").getAsString().split(";");
                     if (two.length == 2) {
-                        bot.brain.setRegionA(parsePos(two[0]));
-                        bot.brain.setRegionB(parsePos(two[1]));
+                        brain.setRegionA(parsePos(two[0]));
+                        brain.setRegionB(parsePos(two[1]));
+                    }
+                }
+                if (o.has("home")) brain.setHome(parsePos(o.get("home").getAsString()));
+                if (o.has("teleport")) brain.setTeleportEnabled(o.get("teleport").getAsBoolean());
+                if (o.has("invuln")) brain.setInvulnerable(o.get("invuln").getAsBoolean());
+                if (o.has("quiet")) brain.setQuiet(o.get("quiet").getAsBoolean());
+                if (o.has("autoSmelt")) brain.setAutoSmelt(o.get("autoSmelt").getAsBoolean());
+                if (o.has("autoRestock")) brain.setAutoRestock(o.get("autoRestock").getAsBoolean());
+                if (o.has("autoHome")) brain.setAutoHome(o.get("autoHome").getAsBoolean());
+                brain.setTotals(o.has("totalBlocks") ? o.get("totalBlocks").getAsInt() : 0,
+                        o.has("totalDeposited") ? o.get("totalDeposited").getAsInt() : 0);
+                if (o.has("stock")) {
+                    for (JsonElement se : o.getAsJsonArray("stock")) {
+                        JsonObject s = se.getAsJsonObject();
+                        Identifier blockId = Identifier.tryParse(s.get("block").getAsString());
+                        Identifier itemId = Identifier.tryParse(s.get("item").getAsString());
+                        Block block = blockId == null ? null : BuiltInRegistries.BLOCK.getOptional(blockId).orElse(null);
+                        Item item = itemId == null ? null : BuiltInRegistries.ITEM.getOptional(itemId).orElse(null);
+                        if (block != null && item != null) {
+                            brain.addStockRule(block, item, s.get("min").getAsInt());
+                        }
                     }
                 }
             } catch (Exception ignored) {
