@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -40,7 +41,8 @@ import java.util.function.Predicate;
  * подойти -> сломать -> пока не хватит.
  *
  * Склад — двусторонний, с телепортом (выключаемо) и самосортировкой.
- * Доп. режимы: quarry (выкапывает всё внутри region), scan, transfer, bring.
+ * Доп. режимы: quarry (выкапывает всё внутри region, работая изнутри ямы),
+ * scan, transfer, bring.
  * Фон: сток-уровни (auto-restock) и автообслуживание печек (autoSmelt).
  * Настройки переключаются командами и chest-GUI (/gatherbot <имя> gui).
  */
@@ -57,6 +59,8 @@ public final class BotBrain {
     private static final int WAREHOUSE_VERTICAL = 3;
     private static final int DEFAULT_PROTECT_RADIUS = 12;
     private static final long MAX_QUARRY_VOLUME = 128000;
+    /** Сколько повторных проходов по слою делает карьер, пока проходы что-то ломают. */
+    private static final int MAX_QUARRY_PASSES = 3;
     private static final int RESTOCK_INTERVAL = 600; // 30 секунд
     private static final int SMELT_INTERVAL = 400;   // 20 секунд
     /** Слотов основного инвентаря игрока (без брони и второй руки). */
@@ -68,7 +72,8 @@ public final class BotBrain {
     private final GatherBot bot;
     private final Deque<GatherTarget> queue = new ArrayDeque<>();
     private final List<String> failed = new ArrayList<>();
-    private final List<BlockPos> deadZones = new ArrayList<>();
+    /** Блэклист недоступных блоков (упакованные BlockPos). Карьер проверяет точечно, добыча — со сферой. */
+    private final Set<Long> deadZones = new HashSet<>();
 
     private GatherTarget current;
     private BlockPos targetPos;
@@ -121,7 +126,11 @@ public final class BotBrain {
 
     // карьер
     private boolean quarryMode;
-    private int qMinX, qMaxX, qMinY, qMaxY, qMinZ, qMaxZ, qX, qY, qZ;
+    private int qMinX, qMaxX, qMinY, qMaxY, qMinZ, qMaxZ, qY;
+    private int qBrokenThisPass;
+    private int qPass;
+    private BlockPos qMoveTarget;
+    private final Set<Long> qBadSpots = new HashSet<>();
 
     public BotBrain(GatherBot bot) {
         this.bot = bot;
@@ -240,12 +249,13 @@ public final class BotBrain {
         depositReturnPos = null;
         needWithdraw = false;
         quarryMode = false;
+        qMoveTarget = null;
         if (report) tell("§e[бот] задача остановлена.");
     }
 
     public String status() {
         if (paused) return "на паузе («" + jobName + "», в очереди " + queue.size() + "). Продолжить: resume";
-        if (quarryMode) return "карьер: выкапываю зону " + qMinX + "," + qMinZ + " .. " + qMaxX + "," + qMaxZ;
+        if (quarryMode) return "карьер: слой y=" + qY + ", зона " + qMinX + "," + qMinZ + " .. " + qMaxX + "," + qMaxZ;
         if (!isRunning()) return "нет активной задачи";
         if (current == null) return "«" + jobName + "»: между задачами, в очереди " + queue.size();
         return "«" + jobName + "»: " + current.label() + " " + countItem(current.item()) + "/" + current.needed()
@@ -439,7 +449,14 @@ public final class BotBrain {
 
     // ---------- карьер ----------
 
-    /** Карьер: выкапывает ВСЁ внутри region слоями сверху вниз. @return false — зона не задана/велика. */
+    /**
+     * Карьер: выкапывает ВСЁ внутри region слоями сверху вниз.
+     * Бот работает изнутри ямы: стоит на недокопанной части слоя или на дне,
+     * ломает всё в радиусе REACH, затем переставляется на новую точку.
+     * Спуск происходит сам: блок под ногами — тоже цель.
+     *
+     * @return false — зона не задана/велика.
+     */
     public boolean startQuarry(UUID owner) {
         if (regionA == null || regionB == null) return false;
         stopJob(false);
@@ -455,15 +472,42 @@ public final class BotBrain {
         qMinX = Math.min(regionA.getX(), regionB.getX()); qMaxX = Math.max(regionA.getX(), regionB.getX());
         qMinY = Math.min(regionA.getY(), regionB.getY()); qMaxY = Math.max(regionA.getY(), regionB.getY());
         qMinZ = Math.min(regionA.getZ(), regionB.getZ()); qMaxZ = Math.max(regionA.getZ(), regionB.getZ());
-        qX = qMinX; qY = qMaxY; qZ = qMinZ;
+        qY = qMaxY;
+        qPass = 0;
+        qBrokenThisPass = 0;
+        qMoveTarget = null;
         quarryMode = true;
         deadZones.clear();
+        qBadSpots.clear();
         skippedUnreachable = 0;
         stuckTicks = 0;
         targetPos = null;
         warnedFull = false;
+        if (depositAnchor != null && protectRadius > 0) {
+            int shielded = countProtectedInRegion();
+            if (shielded > 0) {
+                tell("§e[бот] защита базы: " + shielded + " блоков зоны в радиусе " + protectRadius
+                        + " от склада копать не буду (отключить: protect off)");
+            }
+        }
         tell("§a[бот] карьер: " + vol + " блоков, слоями сверху вниз. Стоп: stop");
         return true;
+    }
+
+    /** Сколько блоков региона карьера выпадает под защиту базы (для предупреждения при старте). */
+    private int countProtectedInRegion() {
+        double r2 = (double) protectRadius * protectRadius;
+        int n = 0;
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int y = qMinY; y <= qMaxY; y++) {
+            for (int x = qMinX; x <= qMaxX; x++) {
+                for (int z = qMinZ; z <= qMaxZ; z++) {
+                    pos.set(x, y, z);
+                    if (pos.distSqr(depositAnchor) <= r2) n++;
+                }
+            }
+        }
+        return n;
     }
 
     private void quarryTick() {
@@ -481,19 +525,25 @@ public final class BotBrain {
             }
             return;
         }
-        if (targetPos == null) {
-            targetPos = nextQuarryBlock();
-            if (targetPos == null) {
-                quarryMode = false;
-                tell("§a[бот] ✔ карьер выкопан!" + unreachableSuffix());
-                if (depositAnchor != null && hasAnythingToDeposit()) {
-                    depositReturnPos = bot.blockPosition();
-                    depositRequested = true;
-                }
+
+        // идём к выбранной точке стояния (режим без телепорта)
+        if (qMoveTarget != null) {
+            if (bot.blockPosition().distSqr(qMoveTarget) <= 2.25) {
+                qMoveTarget = null;
+                bot.zza = 0;
+                bot.setSprinting(false);
+            } else {
+                walkToQuarrySpot(qMoveTarget);
                 return;
             }
-            stuckTicks = 0;
-            lastPos = bot.blockPosition();
+        }
+
+        if (targetPos == null) {
+            targetPos = findQuarryTarget();
+            if (targetPos == null) {
+                advanceQuarry();
+                return;
+            }
         }
         BlockState state = level().getBlockState(targetPos);
         if (state.isAir() || !state.getFluidState().isEmpty() || state.getDestroySpeed(level(), targetPos) < 0) {
@@ -511,26 +561,141 @@ public final class BotBrain {
         }
     }
 
-    /** Следующий блок карьера: слоями сверху вниз, пропуская пустоту/жидкости/неломаемое. */
-    private BlockPos nextQuarryBlock() {
+    /** Ближайший ломаемый блок текущего слоя в пределах REACH от глаз бота. Сканирует только окно ±REACH. */
+    private BlockPos findQuarryTarget() {
         ServerLevel level = level();
-        while (qY >= qMinY) {
-            BlockPos pos = new BlockPos(qX, qY, qZ);
-            if (++qZ > qMaxZ) {
-                qZ = qMinZ;
-                if (++qX > qMaxX) {
-                    qX = qMinX;
-                    qY--;
+        Vec3 eye = bot.getEyePosition();
+        int r = (int) Math.ceil(REACH);
+        BlockPos bp = bot.blockPosition();
+        int x0 = Math.max(qMinX, bp.getX() - r), x1 = Math.min(qMaxX, bp.getX() + r);
+        int z0 = Math.max(qMinZ, bp.getZ() - r), z1 = Math.min(qMaxZ, bp.getZ() + r);
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int x = x0; x <= x1; x++) {
+            for (int z = z0; z <= z1; z++) {
+                pos.set(x, qY, z);
+                if (deadZones.contains(pos.asLong())) continue;
+                if (!level.hasChunkAt(pos)) continue;
+                if (isProtected(pos)) continue;
+                BlockState state = level.getBlockState(pos);
+                if (state.isAir() || !state.getFluidState().isEmpty()) continue;
+                if (state.getDestroySpeed(level, pos) < 0) continue;
+                double d = eye.distanceTo(Vec3.atCenterOf(pos));
+                if (d > REACH) continue;
+                if (d < bestDist) {
+                    bestDist = d;
+                    best = pos.immutable();
                 }
             }
-            if (!level.hasChunkAt(pos)) continue;
-            if (inDeadZone(pos) || isProtected(pos)) continue;
-            BlockState state = level.getBlockState(pos);
-            if (state.isAir() || !state.getFluidState().isEmpty()) continue;
-            if (state.getDestroySpeed(level, pos) < 0) continue;
-            return pos;
         }
-        return null;
+        return best;
+    }
+
+    /** Есть ли ломаемый блок слоя qY в пределах REACH от глаз, если встать в feet. */
+    private boolean hasTargetInReach(ServerLevel level, BlockPos feet) {
+        Vec3 eye = Vec3.atBottomCenterOf(feet).add(0, 1.62, 0);
+        int r = (int) Math.ceil(REACH);
+        int x0 = Math.max(qMinX, feet.getX() - r), x1 = Math.min(qMaxX, feet.getX() + r);
+        int z0 = Math.max(qMinZ, feet.getZ() - r), z1 = Math.min(qMaxZ, feet.getZ() + r);
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int x = x0; x <= x1; x++) {
+            for (int z = z0; z <= z1; z++) {
+                pos.set(x, qY, z);
+                if (deadZones.contains(pos.asLong())) continue;
+                if (!level.hasChunkAt(pos)) continue;
+                if (isProtected(pos)) continue;
+                BlockState state = level.getBlockState(pos);
+                if (state.isAir() || !state.getFluidState().isEmpty()) continue;
+                if (state.getDestroySpeed(level, pos) < 0) continue;
+                if (eye.distanceTo(Vec3.atCenterOf(pos)) <= REACH) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Точка стояния внутри выкопанной области, откуда достаётся хоть один блок слоя qY.
+     * Ищем клетки с ногами на y=qY (дно ямы) и y=qY+1 (ещё не скопанный блок-цель как опора).
+     */
+    private BlockPos findQuarryStandSpot() {
+        ServerLevel level = level();
+        BlockPos botPos = bot.blockPosition();
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        BlockPos.MutableBlockPos feet = new BlockPos.MutableBlockPos();
+        for (int x = qMinX; x <= qMaxX; x++) {
+            for (int z = qMinZ; z <= qMaxZ; z++) {
+                for (int y = qY; y <= qY + 1; y++) {
+                    feet.set(x, y, z);
+                    if (qBadSpots.contains(feet.asLong())) continue;
+                    if (!isStandable(level, feet)) continue;
+                    if (!hasTargetInReach(level, feet)) continue;
+                    double d = feet.distSqr(botPos);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        best = feet.immutable();
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /** В досягаемости слой пуст: переставить бота на новую точку или закончить проход/слой. */
+    private void advanceQuarry() {
+        BlockPos spot = findQuarryStandSpot();
+        if (spot != null) {
+            if (teleportEnabled) {
+                bot.teleportTo(level(), spot.getX() + 0.5, spot.getY(), spot.getZ() + 0.5,
+                        Set.of(), bot.getYRot(), bot.getXRot(), true);
+            } else {
+                qMoveTarget = spot;
+            }
+            return;
+        }
+        // стоять больше негде — проход по слою окончен
+        if (qBrokenThisPass > 0 && qPass < MAX_QUARRY_PASSES) {
+            // проход что-то сломал — повторяем: осыпавшийся гравий, цели, ставшие доступными
+            qPass++;
+            qBrokenThisPass = 0;
+            deadZones.clear();
+            qBadSpots.clear();
+            return;
+        }
+        // слой выкопан — вниз
+        qY--;
+        qPass = 0;
+        qBrokenThisPass = 0;
+        deadZones.clear();
+        qBadSpots.clear();
+        if (qY < qMinY) {
+            quarryMode = false;
+            tell("§a[бот] ✔ карьер выкопан!" + unreachableSuffix());
+            if (depositAnchor != null && hasAnythingToDeposit()) {
+                depositReturnPos = bot.blockPosition();
+                depositRequested = true;
+            }
+        }
+    }
+
+    /** Ходьба к точке стояния карьера: застрял — точка в блэклист, выберем другую. */
+    private void walkToQuarrySpot(BlockPos spot) {
+        bot.lookAt(EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(spot));
+        bot.zza = 1.0F;
+        bot.setSprinting(true);
+        if (bot.horizontalCollision && bot.onGround()) {
+            bot.jumpFromGround();
+        }
+        if (++stuckTicks >= STUCK_TICKS) {
+            boolean inWater = !level().getFluidState(bot.blockPosition()).isEmpty();
+            if (!inWater && lastPos != null && bot.blockPosition().distSqr(lastPos) < 1.0) {
+                qBadSpots.add(spot.asLong());
+                qMoveTarget = null;
+            }
+            stuckTicks = 0;
+            lastPos = bot.blockPosition();
+        }
     }
 
     // ---------- тик ----------
@@ -801,7 +966,7 @@ public final class BotBrain {
     }
 
     private void walkTo(BlockPos pos) {
-        abortMining();
+        if (miningPos != null) abortMining(); // сброс ломания один раз при уходе, а не каждый тик
         bot.lookAt(EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(pos));
         bot.zza = 1.0F;
         bot.setSprinting(true);
@@ -809,7 +974,9 @@ public final class BotBrain {
             bot.jumpFromGround();
         }
         if (++stuckTicks >= STUCK_TICKS) {
-            if (lastPos != null && bot.blockPosition().distSqr(lastPos) < 1.0) {
+            // в воде движение медленное — это не застревание
+            boolean inWater = !level().getFluidState(bot.blockPosition()).isEmpty();
+            if (!inWater && lastPos != null && bot.blockPosition().distSqr(lastPos) < 1.0) {
                 markUnreachable(pos);
                 targetPos = null;
                 scanCooldown = 1;
@@ -820,10 +987,10 @@ public final class BotBrain {
     }
 
     private void markUnreachable(BlockPos pos) {
-        deadZones.add(pos);
+        deadZones.add(pos.asLong());
         skippedUnreachable++;
         if (skippedUnreachable == 1) {
-            tell("§e[бот] не могу подойти к " + pos.toShortString() + " — вычёркиваю участок"
+            tell("§e[бот] не могу подойти к " + pos.toShortString() + " — вычёркиваю его"
                     + (current != null ? " и ищу другой " + current.label() : ""));
         }
         if (current != null && deadZones.size() >= MAX_DEAD_ZONES) {
@@ -1108,6 +1275,7 @@ public final class BotBrain {
             miningProgress = 0;
             sessionBlocks++;
             totalBlocks++;
+            if (quarryMode) qBrokenThisPass++;
         } else {
             level().destroyBlockProgress(bot.getId(), pos, (int) (miningProgress * 10));
         }
@@ -1134,7 +1302,7 @@ public final class BotBrain {
                     pos.set(center.getX() + dx, center.getY() + dy, center.getZ() + dz);
                     if (!level.hasChunkAt(pos)) continue;
                     if (!level.getBlockState(pos).is(block)) continue;
-                    if (inDeadZone(pos)) continue;
+                    if (inDeadZoneArea(pos)) continue;
                     if (!isExposed(level, pos)) continue;
                     if (isProtected(pos)) continue;
                     if (!inRegion(pos)) continue;
@@ -1171,9 +1339,16 @@ public final class BotBrain {
         return false;
     }
 
+    /** Точечная проверка (карьер): сам блок в блэклисте. O(1). */
     private boolean inDeadZone(BlockPos pos) {
-        for (BlockPos zone : deadZones) {
-            if (pos.distSqr(zone) <= (double) DEAD_ZONE_RADIUS * DEAD_ZONE_RADIUS) return true;
+        return deadZones.contains(pos.asLong());
+    }
+
+    /** Сфера радиусом DEAD_ZONE_RADIUS (добыча по схематике): вычёркиваем весь недоступный участок. */
+    private boolean inDeadZoneArea(BlockPos pos) {
+        double r2 = (double) DEAD_ZONE_RADIUS * DEAD_ZONE_RADIUS;
+        for (Long zone : deadZones) {
+            if (pos.distSqr(BlockPos.of(zone)) <= r2) return true;
         }
         return false;
     }
