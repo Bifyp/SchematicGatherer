@@ -17,18 +17,17 @@ jobs:
           java-version: "25"
 
       # Baritone нужен только чтобы скомпилировать клиентскую команду #gather.
-      # Maven-артефакта под 26.1 нет → собираем из исходников.
+      # Maven-артефакта под 26.1 нет → собираем из исходников, ветка 26.1.
+      # Берём именно unoptimized-флейвор: в api/standalone ProGuard срезает
+      # атрибут Exceptions, и ICommand.execute теряет throws CommandException.
       - name: Cache Baritone jar
         id: baritone-cache
         uses: actions/cache@v4
         with:
           path: libs/baritone-fabric.jar
-          key: baritone-26.1-2
+          key: baritone-26.1-unoptimized-1
 
-      # Если баритон не соберётся — не валим весь билд, а собираем серверную часть (/gatherbot)
       - name: Build Baritone (branch 26.1)
-        id: baritone
-        continue-on-error: true
         if: steps.baritone-cache.outputs.cache-hit != 'true'
         run: |
           git clone --branch 26.1 --single-branch https://github.com/cabaletta/baritone.git baritone-src
@@ -37,20 +36,10 @@ jobs:
           ./gradlew build -Pmod_version="1.18.0" --no-daemon
           cd ..
           mkdir -p libs
-          JAR=$(find baritone-src/fabric/build/libs -name "baritone-fabric-*.jar" ! -name "*-dev*" ! -name "*-sources*" | sort | head -1)
+          JAR=$(find baritone-src/fabric/build/libs -name "baritone-unoptimized-fabric-*.jar" ! -name "*-dev*" ! -name "*-sources*" | sort | head -1)
           echo "Baritone jar: $JAR"
+          test -f "$JAR"
           cp "$JAR" libs/baritone-fabric.jar
-
-      - name: Fallback — сборка только /gatherbot (без Baritone)
-        if: hashFiles('libs/baritone-fabric.jar') == ''
-        run: |
-          echo "::warning::Baritone jar недоступен — собираю без клиентской команды #gather"
-          rm -f src/main/java/dev/bifyp/schematicgatherer/SchematicGathererMod.java \
-                src/main/java/dev/bifyp/schematicgatherer/GatherCommand.java \
-                src/main/java/dev/bifyp/schematicgatherer/GatherProcess.java \
-                src/main/java/dev/bifyp/schematicgatherer/MaterialCounter.java
-          jq 'del(.entrypoints.client)' src/main/resources/fabric.mod.json > fabric.mod.json.tmp
-          mv fabric.mod.json.tmp src/main/resources/fabric.mod.json
 
       # loom 1.17-SNAPSHOT собран под Gradle 9.5 — меньше нельзя
       - name: Setup Gradle
