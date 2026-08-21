@@ -3,6 +3,7 @@ package dev.bifyp.schematicgatherer.bot;
 import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.server.level.ServerLevel;
@@ -21,7 +22,9 @@ import net.minecraft.world.phys.Vec3;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -31,16 +34,20 @@ import java.util.UUID;
  * Движение без A* (прямая + прыжок через одиночный блок), с «мёртвыми зонами»
  * вокруг мест застревания и без спама в чат.
  *
- * Склад (depositPos, задаётся /gatherbot <имя> deposit ...). Разгрузка случается:
+ * Склад (depositAnchor, задаётся /gatherbot <имя> deposit ...). Разгрузка случается:
  *  - когда инвентарь полностью заполнен во время задачи;
  *  - после завершения задачи (если есть что нести);
  *  - по команде «deposit now» — в любой момент, даже без задачи.
  *
+ * БОЛЬШОЙ СКЛАД: якорь — центр склада. Когда текущий контейнер полон или пропал,
+ * бот идёт к следующему контейнеру в радиусе 8 (±3 по вертикали) от якоря —
+ * складывать можно сразу много ресурсов в стену сундуков/бочек.
+ *
  * Если до склада по прямой не дойти (шахта, стена), бот ПРОКАПЫВАЕТСЯ:
- * туннель 1×2 вперёд, при складе ниже — ступеньки вниз (ломает пол перед собой).
- * Предохранители: не ломает неломаемое, отказывается при лаве в ячейке или рядом
- * с ней, не копает вверх, лимит MAX_TUNNEL_BLOCKS блоков за один заход.
- * Перекладывается всё, кроме предмета в активном слоте (инструмента).
+ * туннель 1×2 вперёд, при складе ниже — ступеньки вниз. Предохранители: не ломает
+ * неломаемое, отказывается при лаве рядом, не копает вверх, лимит MAX_TUNNEL_BLOCKS.
+ *
+ * skip: «skip» — пропустить текущую цель, «skip <id>» — вычеркнуть ресурс из плана.
  */
 public final class BotBrain {
 
@@ -55,6 +62,9 @@ public final class BotBrain {
     private static final int MAX_DEAD_ZONES = 60;
     /** Сколько блоков максимум прокапываем за один поход к складу. */
     private static final int MAX_TUNNEL_BLOCKS = 64;
+    /** Радиус поиска контейнеров склада вокруг якоря. */
+    private static final int WAREHOUSE_RADIUS = 8;
+    private static final int WAREHOUSE_VERTICAL = 3;
 
     private final GatherBot bot;
     private final Deque<GatherTarget> queue = new ArrayDeque<>();
@@ -74,7 +84,9 @@ public final class BotBrain {
     private int radius = 48;
 
     // склад (задаётся командой, живёт пока бот заспавнен)
-    private BlockPos depositPos;
+    private BlockPos depositAnchor;   // центр склада — то, что задали командой
+    private BlockPos depositPos;      // контейнер, в который складываем прямо сейчас
+    private final Set<BlockPos> triedChests = new HashSet<>();
     private boolean depositRequested;
     private boolean chestUnreachable;
     private boolean warnedFull;
@@ -105,8 +117,10 @@ public final class BotBrain {
         chestStuckTicks = 0;
         diggingCells.clear();
         dugThisTrip = 0;
+        triedChests.clear();
+        depositPos = depositAnchor;
         tell("§a[бот] задача «" + name + "»: позиций " + targets.size() + ", радиус поиска " + radius
-                + (depositPos == null ? "" : ", склад: " + depositPos.toShortString()));
+                + (depositAnchor == null ? "" : ", склад: " + depositAnchor.toShortString()));
     }
 
     public void stopJob(boolean report) {
@@ -130,10 +144,48 @@ public final class BotBrain {
                 + ", в очереди " + queue.size();
     }
 
+    // ---------- skip ----------
+
+    /** Пропустить текущую цель. @return false, если активной цели нет. */
+    public boolean skipCurrent() {
+        if (current == null) return false;
+        tell("§e[бот] пропускаю: " + current.label());
+        nextTarget();
+        return true;
+    }
+
+    /** Вычеркнуть из плана все цели с таким предметом/блоком. @return сколько позиций убрано. */
+    public int skipById(String id) {
+        String path = id.contains(":") ? id.substring(id.indexOf(':') + 1) : id;
+        int removed = 0;
+        var it = queue.iterator();
+        while (it.hasNext()) {
+            GatherTarget t = it.next();
+            if (matchesId(t, path)) {
+                it.remove();
+                removed++;
+            }
+        }
+        if (current != null && matchesId(current, path)) {
+            tell("§e[бот] пропускаю текущую цель: " + current.label());
+            nextTarget();
+            removed++;
+        }
+        return removed;
+    }
+
+    private static boolean matchesId(GatherTarget t, String path) {
+        return t.label().equals(path)
+                || BuiltInRegistries.ITEM.getKey(t.item()).getPath().equals(path)
+                || BuiltInRegistries.BLOCK.getKey(t.block()).getPath().equals(path);
+    }
+
     // ---------- склад ----------
 
     public void setDeposit(BlockPos pos) {
+        this.depositAnchor = pos;
         this.depositPos = pos;
+        this.triedChests.clear();
         this.chestUnreachable = false;
         this.warnedFull = false;
         this.chestStuckTicks = 0;
@@ -142,13 +194,15 @@ public final class BotBrain {
     }
 
     public void clearDeposit() {
+        this.depositAnchor = null;
         this.depositPos = null;
         this.chestUnreachable = false;
         this.diggingCells.clear();
     }
 
+    /** Якорь склада (центр, заданный командой). */
     public BlockPos getDeposit() {
-        return depositPos;
+        return depositAnchor;
     }
 
     /** Ручная команда «deposit now»: дойти до склада и разгрузиться прямо сейчас. */
@@ -156,6 +210,8 @@ public final class BotBrain {
         chestUnreachable = false; // после ручной команды даём складу второй шанс
         chestStuckTicks = 0;
         dugThisTrip = 0;
+        triedChests.clear();
+        depositPos = depositAnchor;
         depositRequested = true;
     }
 
@@ -171,7 +227,7 @@ public final class BotBrain {
         if (depositRequested) {
             abortMining();
             targetPos = null;
-            if (depositPos == null || chestUnreachable || depositTick()) {
+            if (depositAnchor == null || chestUnreachable || depositTick()) {
                 depositRequested = false;
             }
             return;
@@ -199,10 +255,10 @@ public final class BotBrain {
 
         // инвентарь полон -> идём разгружаться (если склад задан и достижим)
         if (isInventoryFull()) {
-            if (depositPos == null || chestUnreachable) {
+            if (depositAnchor == null || chestUnreachable) {
                 if (!warnedFull) {
                     warnedFull = true;
-                    tell(depositPos == null
+                    tell(depositAnchor == null
                             ? "§e[бот] инвентарь полон, склад не задан — дропы останутся лежать. "
                               + "Задай: /gatherbot " + bot.getGameProfile().name() + " deposit here (глядя на сундук)"
                             : "§e[бот] инвентарь полон, а до склада не добраться — дропы останутся лежать.");
@@ -301,7 +357,9 @@ public final class BotBrain {
 
     // ---------- склад: ходьба, прокапывание, разгрузка ----------
 
-    /** @return true — разгрузка завершена (успешно переложили или отказались от попыток). */
+    private enum DepositResult { DONE, NEXT_CHEST, FAILED }
+
+    /** @return true — разгрузка завершена (успешно, склад полон или отказ). */
     private boolean depositTick() {
         double dist = bot.getEyePosition().distanceTo(Vec3.atCenterOf(depositPos));
         if (dist <= CHEST_REACH) {
@@ -309,8 +367,7 @@ public final class BotBrain {
             diggingCells.clear();
             bot.zza = 0;
             bot.setSprinting(false);
-            depositItems();
-            return true;
+            return depositItems() != DepositResult.NEXT_CHEST;
         }
 
         // режим «прокапываюсь»: ломаем очередную ячейку туннеля
@@ -433,13 +490,41 @@ public final class BotBrain {
         return true;
     }
 
-    /** Перекладывает в контейнер всё, кроме предмета в активном слоте (инструмента). */
-    private void depositItems() {
+    /**
+     * Разгрузка в контейнер под рукой. Контейнер полон или пропал — переключаемся
+     * на следующий контейнер склада (большой склад = много сундуков вокруг якоря).
+     */
+    private DepositResult depositItems() {
         if (!(level().getBlockEntity(depositPos) instanceof Container container)) {
+            triedChests.add(depositPos);
+            if (switchToNextChest()) return DepositResult.NEXT_CHEST;
             chestUnreachable = true;
-            tell("§c[бот] на " + depositPos.toShortString() + " нет контейнера — разгрузка отключена.");
-            return;
+            tell("§c[бот] на складе не осталось контейнеров — разгрузка отключена.");
+            return DepositResult.FAILED;
         }
+        int moved = moveAllInto(container);
+        if (!hasAnythingToDeposit()) {
+            dugThisTrip = 0;
+            tell(moved > 0
+                    ? "§7[бот] разгрузился на склад (предметов: " + moved + ")"
+                    : "§7[бот] нечего складывать");
+            return DepositResult.DONE;
+        }
+        // контейнер полон — следующий
+        triedChests.add(depositPos);
+        if (switchToNextChest()) {
+            tell("§7[бот] контейнер полон — иду к следующему на складе…");
+            return DepositResult.NEXT_CHEST;
+        }
+        chestUnreachable = true;
+        tell(moved > 0
+                ? "§c[бот] склад заполнен — влезло только " + moved + ". Разгрузка отключена."
+                : "§c[бот] склад заполнен — разгрузка отключена.");
+        return DepositResult.FAILED;
+    }
+
+    /** Перекладывает в контейнер всё, кроме предмета в активном слоте (инструмента). */
+    private int moveAllInto(Container container) {
         Inventory inv = bot.getInventory();
         int moved = 0;
         for (int i = 0; i < inv.getContainerSize(); i++) {
@@ -452,13 +537,40 @@ public final class BotBrain {
             inv.setItem(i, left == 0 ? ItemStack.EMPTY : remainder);
         }
         container.setChanged();
-        dugThisTrip = 0;
-        if (moved > 0) {
-            tell("§7[бот] разгрузился в склад (предметов: " + moved + ")");
-        } else {
-            chestUnreachable = true;
-            tell("§c[бот] склад полон — разгрузка отключена.");
+        return moved;
+    }
+
+    private boolean switchToNextChest() {
+        BlockPos next = findNextChest();
+        if (next == null) return false;
+        depositPos = next;
+        chestStuckTicks = 0;
+        diggingCells.clear();
+        return true;
+    }
+
+    /** Следующий неиспользованный контейнер вокруг якоря склада, ближайший первым. */
+    private BlockPos findNextChest() {
+        ServerLevel level = level();
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int dy = -WAREHOUSE_VERTICAL; dy <= WAREHOUSE_VERTICAL; dy++) {
+            for (int dx = -WAREHOUSE_RADIUS; dx <= WAREHOUSE_RADIUS; dx++) {
+                for (int dz = -WAREHOUSE_RADIUS; dz <= WAREHOUSE_RADIUS; dz++) {
+                    pos.set(depositAnchor.getX() + dx, depositAnchor.getY() + dy, depositAnchor.getZ() + dz);
+                    if (!level.hasChunkAt(pos)) continue;
+                    if (triedChests.contains(pos.immutable())) continue;
+                    if (!(level.getBlockEntity(pos) instanceof Container)) continue;
+                    double d = pos.distSqr(depositAnchor);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        best = pos.immutable();
+                    }
+                }
+            }
         }
+        return best;
     }
 
     private boolean isInventoryFull() {
@@ -571,7 +683,7 @@ public final class BotBrain {
     }
 
     private void finish() {
-        boolean goDeposit = depositPos != null && !chestUnreachable && hasAnythingToDeposit();
+        boolean goDeposit = depositAnchor != null && !chestUnreachable && hasAnythingToDeposit();
         tell("§a[бот] ✔ задача «" + jobName + "» завершена!" + (goDeposit ? " Несу добытое на склад…" : ""));
         if (!failed.isEmpty()) {
             tell("§c[бот] не удалось:");
@@ -580,7 +692,11 @@ public final class BotBrain {
         failed.clear();
         bot.zza = 0;
         bot.setSprinting(false);
-        depositRequested = goDeposit;
+        if (goDeposit) {
+            triedChests.clear();
+            depositPos = depositAnchor;
+            depositRequested = true;
+        }
     }
 
     private int countItem(Item item) {

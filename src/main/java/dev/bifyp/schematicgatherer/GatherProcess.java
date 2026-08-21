@@ -11,6 +11,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.Container;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.inventory.ContainerInput;
@@ -29,10 +30,12 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Конечный автомат сбора ресурсов.
@@ -41,19 +44,18 @@ import java.util.Optional;
  * следим за инвентарём → переходим к следующей. Если #mine завершился,
  * а предметов всё ещё не хватает — один повтор, потом позиция уходит в «не удалось».
  *
- * Улучшения поведения (0.5.x):
- *  - следующая цель выбирается по БЛИЗОСТИ (один проход по локальному объёму),
- *    а не тупо по количеству — меньше беготни через всю шахту туда-сюда;
+ * Улучшения поведения:
+ *  - следующая цель выбирается по БЛИЗОСТИ (один проход по локальному объёму);
  *  - после каждой цели подбирается валяющийся рядом дроп этого ресурса;
- *  - repack() не чаще раза в 5 секунд (не тупит между целями);
- *  - на время сбора allowPlace=false: БЕЗ пилларинга — не ставит мусорные блоки,
- *    чтобы достать один блок над головой, когда рядом полно такого же на полу
- *    (старое значение настройки возвращается после сбора/разгрузки/stop);
- *  - при старте включается mineScanDroppedItems (подбор дропа во время майна).
+ *  - repack() не чаще раза в 5 секунд;
+ *  - на время сбора allowPlace=false: БЕЗ пилларинга (возвращаем после);
+ *  - при старте включается mineScanDroppedItems;
+ *  - skip: «#gather skip» — пропустить текущую цель, «#gather skip <id>» — вычеркнуть из плана.
  *
- * Склад (depositPos, задаётся «#gather deposit ...»). Разгрузка: при полном
+ * Склад (depositAnchor, задаётся «#gather deposit ...»). Разгрузка: при полном
  * инвентаре, после завершения сбора, по команде «deposit now». Путь строит
- * Baritone (GoalGetToBlock). После разгрузки сбор продолжается с текущей цели.
+ * Baritone (GoalGetToBlock). БОЛЬШОЙ СКЛАД: контейнер полон — идём к следующему
+ * в радиусе 8 от якоря. После разгрузки сбор продолжается с текущей цели.
  */
 public final class GatherProcess implements Helper {
 
@@ -97,6 +99,9 @@ public final class GatherProcess implements Helper {
     private static final int REPACK_COOLDOWN = 100;
     /** Сколько тиков максимум подбираем дроп после цели. */
     private static final int CLEANUP_TIMEOUT = 200;
+    /** Радиус поиска контейнеров склада вокруг якоря. */
+    private static final int WAREHOUSE_RADIUS = 8;
+    private static final int WAREHOUSE_VERTICAL = 3;
 
     private final Deque<Task> queue = new ArrayDeque<>();
     private final List<String> failed = new ArrayList<>();
@@ -105,7 +110,9 @@ public final class GatherProcess implements Helper {
     private String schematicName = "";
 
     // склад
-    private BlockPos depositPos;
+    private BlockPos depositAnchor;   // центр склада — то, что задали командой
+    private BlockPos depositPos;      // контейнер, в который идём прямо сейчас
+    private final Set<BlockPos> triedChests = new HashSet<>();
     private DepositStage depositStage = DepositStage.IDLE;
     private boolean depositRequested;
     private boolean chestUnreachable;
@@ -173,7 +180,7 @@ public final class GatherProcess implements Helper {
         BaritoneAPI.getSettings().allowPlace.value = false;
 
         logDirect("Схематика «" + schematicName + "»: позиций " + parsed.tasks().size() + ", предметов ~" + parsed.totalItems()
-                + (depositPos == null ? "" : ", склад: " + depositPos.toShortString()));
+                + (depositAnchor == null ? "" : ", склад: " + depositAnchor.toShortString()));
         parsed.lines().stream().limit(15).forEach(this::logDirect);
         if (parsed.lines().size() > 15) {
             logDirect("…и ещё " + (parsed.lines().size() - 15) + " (полный список: #gather list " + schematicName + ")");
@@ -187,7 +194,7 @@ public final class GatherProcess implements Helper {
         }
         queue.addAll(parsed.tasks());
         running = true;
-        logDirect("Погнали! Остановка: #gather stop");
+        logDirect("Погнали! Остановка: #gather stop. Пропуск: #gather skip [id]");
     }
 
     public void cancel() {
@@ -240,26 +247,62 @@ public final class GatherProcess implements Helper {
         }
     }
 
+    // ---------- skip ----------
+
+    /** Пропустить текущую цель. @return false, если активной цели нет. */
+    public boolean skipCurrent() {
+        if (current == null) return false;
+        IBaritone baritone = BaritoneAPI.getProvider().getPrimaryBaritone();
+        if (baritone != null) {
+            baritone.getMineProcess().cancel();
+        }
+        logDirect("Пропускаю: " + current.label, ChatFormatting.YELLOW);
+        current = null;
+        return true;
+    }
+
+    /** Вычеркнуть из плана все цели с таким предметом/блоком. @return сколько позиций убрано. */
+    public int skipById(String id) {
+        String path = id.contains(":") ? id.substring(id.indexOf(':') + 1) : id;
+        int removed = 0;
+        var it = queue.iterator();
+        while (it.hasNext()) {
+            Task t = it.next();
+            if (t.label.equals(path) || blockName(t.mineBlock).equals(path)) {
+                it.remove();
+                removed++;
+            }
+        }
+        if (current != null && (current.label.equals(path) || blockName(current.mineBlock).equals(path))) {
+            skipCurrent();
+            removed++;
+        }
+        return removed;
+    }
+
     // ---------- склад ----------
 
     public BlockPos getDeposit() {
-        return depositPos;
+        return depositAnchor;
     }
 
     public void setDeposit(BlockPos pos) {
+        this.depositAnchor = pos;
         this.depositPos = pos;
+        this.triedChests.clear();
         this.chestUnreachable = false;
         this.warnedFull = false;
     }
 
     public void clearDeposit() {
+        this.depositAnchor = null;
         this.depositPos = null;
         this.chestUnreachable = false;
     }
 
     /** «#gather deposit now» — разгрузиться прямо сейчас, даже без активного сбора. */
     public boolean requestDeposit() {
-        if (depositPos == null) {
+        if (depositAnchor == null) {
             logDirect("Склад не задан. Сначала: #gather deposit here (глядя на сундук)", ChatFormatting.RED);
             return false;
         }
@@ -279,8 +322,8 @@ public final class GatherProcess implements Helper {
         // ручная разгрузка — работает и без активного сбора
         if (depositRequested && depositStage == DepositStage.IDLE) {
             depositRequested = false;
-            if (depositPos != null) {
-                logDirect("Иду разгружаться на склад " + depositPos.toShortString() + "…");
+            if (depositAnchor != null) {
+                logDirect("Иду разгружаться на склад " + depositAnchor.toShortString() + "…");
                 startDeposit(baritone);
             }
         }
@@ -316,12 +359,12 @@ public final class GatherProcess implements Helper {
 
         // инвентарь полон — едем разгружаться, потом продолжим с этой же цели
         if (isInventoryFull(mc)) {
-            if (depositPos != null && !chestUnreachable) {
-                logDirect("Инвентарь полон — иду разгружаться на склад " + depositPos.toShortString() + "…");
+            if (depositAnchor != null && !chestUnreachable) {
+                logDirect("Инвентарь полон — иду разгружаться на склад " + depositAnchor.toShortString() + "…");
                 startDeposit(baritone);
                 return;
             }
-            if (depositPos == null && !warnedFull) {
+            if (depositAnchor == null && !warnedFull) {
                 warnedFull = true;
                 logDirect("Инвентарь полон, склад не задан — дропы останутся лежать. "
                         + "Задай: #gather deposit here (глядя на сундук)", ChatFormatting.YELLOW);
@@ -407,7 +450,7 @@ public final class GatherProcess implements Helper {
         running = false;
         current = null;
         Minecraft mc = Minecraft.getInstance();
-        boolean goDeposit = depositPos != null && !chestUnreachable
+        boolean goDeposit = depositAnchor != null && !chestUnreachable
                 && mc.player != null && hasAnythingToDeposit(mc);
         logDirect("✔ Сбор для «" + schematicName + "» завершён!" + (goDeposit ? " Несу добытое на склад…" : ""));
         if (!failed.isEmpty()) {
@@ -501,6 +544,8 @@ public final class GatherProcess implements Helper {
 
     private void startDeposit(IBaritone baritone) {
         baritone.getMineProcess().cancel();
+        depositPos = depositAnchor;
+        triedChests.clear();
         depositStage = DepositStage.WALKING;
         walkTicks = 0;
         pathRetries = 0;
@@ -556,7 +601,19 @@ public final class GatherProcess implements Helper {
                 if (!hasMovableItems(mc)) {
                     endDeposit(mc, baritone, "✔ Разгрузился на складе");
                 } else if (moved == 0 && ++dumpStuckTicks > 20) {
-                    endDeposit(mc, baritone, "⚠ Склад полон — часть осталась при мне");
+                    // контейнер полон — пробуем следующий на большом складе
+                    triedChests.add(depositPos);
+                    BlockPos next = findNextChest(mc);
+                    if (next != null) {
+                        depositPos = next;
+                        logDirect("Контейнер полон — иду к следующему на складе…");
+                        depositStage = DepositStage.WALKING;
+                        walkTicks = 0;
+                        pathRetries = 0;
+                        baritone.getCustomGoalProcess().setGoalAndPath(new GoalGetToBlock(depositPos));
+                    } else {
+                        endDeposit(mc, baritone, "⚠ Склад заполнен — часть осталась при мне");
+                    }
                 } else if (moved > 0) {
                     dumpStuckTicks = 0;
                 }
@@ -568,6 +625,29 @@ public final class GatherProcess implements Helper {
     private void rightClickChest(Minecraft mc) {
         mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND,
                 new BlockHitResult(Vec3.atCenterOf(depositPos), Direction.UP, depositPos, false));
+    }
+
+    /** Следующий неиспользованный контейнер вокруг якоря склада, ближайший первым. */
+    private BlockPos findNextChest(Minecraft mc) {
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int dy = -WAREHOUSE_VERTICAL; dy <= WAREHOUSE_VERTICAL; dy++) {
+            for (int dx = -WAREHOUSE_RADIUS; dx <= WAREHOUSE_RADIUS; dx++) {
+                for (int dz = -WAREHOUSE_RADIUS; dz <= WAREHOUSE_RADIUS; dz++) {
+                    pos.set(depositAnchor.getX() + dx, depositAnchor.getY() + dy, depositAnchor.getZ() + dz);
+                    if (!mc.level.hasChunkAt(pos)) continue;
+                    if (triedChests.contains(pos.immutable())) continue;
+                    if (!(mc.level.getBlockEntity(pos) instanceof Container)) continue;
+                    double d = pos.distSqr(depositAnchor);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        best = pos.immutable();
+                    }
+                }
+            }
+        }
+        return best;
     }
 
     /**

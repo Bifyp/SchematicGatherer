@@ -41,7 +41,7 @@ public final class GatherCommand extends Command {
     public void execute(String label, IArgConsumer args) throws CommandException {
         if (!args.hasAny()) {
             process.printStatus();
-            logDirect("Использование: " + label + " <схематика> | list <схематика> | status | stop | deposit [here|now|set x y z|clear]");
+            logDirect("Использование: " + label + " <схематика> | list <схематика> | status | stop | skip [id] | deposit [here|now|set x y z|clear]");
             return;
         }
         String sub = args.peekString().toLowerCase(Locale.US);
@@ -55,6 +55,17 @@ public final class GatherCommand extends Command {
                 args.get();
                 args.requireMax(0);
                 process.printStatus();
+            }
+            case "skip" -> {
+                args.get();
+                if (args.hasAny()) {
+                    String id = args.getString();
+                    args.requireMax(0);
+                    int removed = process.skipById(id);
+                    logDirect(removed == 0 ? "В плане нет «" + id + "»" : "Вычеркнуто позиций: " + removed);
+                } else if (!process.skipCurrent()) {
+                    logDirect("Нет активной цели — нечего скипать");
+                }
             }
             case "deposit" -> {
                 args.get();
@@ -81,7 +92,8 @@ public final class GatherCommand extends Command {
         if (!args.hasAny()) {
             BlockPos pos = process.getDeposit();
             logDirect(pos == null
-                    ? "Склад не задан. Задай: deposit here (глядя на сундук) или deposit set <x> <y> <z>"
+                    ? "Склад не задан. Задай: deposit here (глядя на сундук) или deposit set <x> <y> <z>. "
+                      + "Работает и с большим складом: контейнеры ищутся в радиусе 8 от якоря."
                     : "Склад: " + pos.toShortString() + " (разгрузиться сейчас: deposit now)");
             return;
         }
@@ -128,7 +140,7 @@ public final class GatherCommand extends Command {
             throw new CommandInvalidStateException(pos.toShortString() + " — не контейнер (нужен сундук/бочка и т.п.)");
         }
         process.setDeposit(pos);
-        logDirect("Склад: " + pos.toShortString());
+        logDirect("Склад: " + pos.toShortString() + " (контейнеры рядом — тоже склад)");
     }
 
     private static int parseCoord(String s) throws CommandException {
@@ -157,7 +169,7 @@ public final class GatherCommand extends Command {
     @Override
     public Stream<String> tabComplete(String label, IArgConsumer args) throws CommandException {
         if (args.hasExactlyOne()) {
-            return Stream.concat(Stream.of("list", "status", "stop", "deposit"), RelativeFile.tabComplete(args, schematicsDir));
+            return Stream.concat(Stream.of("list", "status", "stop", "skip", "deposit"), RelativeFile.tabComplete(args, schematicsDir));
         }
         if (args.has(2)) {
             String first = args.getString();
@@ -186,6 +198,8 @@ public final class GatherCommand extends Command {
                 "> gather list <файл> — только показать список материалов",
                 "> gather status — прогресс",
                 "> gather stop — остановить (останавливает и разгрузку)",
+                "> gather skip — пропустить текущий ресурс",
+                "> gather skip <id> — вычеркнуть ресурс из плана (напр. skip gravel)",
                 "> gather deposit — показать заданный склад",
                 "> gather deposit here — запомнить сундук, на который смотришь",
                 "> gather deposit set <x> <y> <z> — задать склад координатами",
@@ -194,9 +208,8 @@ public final class GatherCommand extends Command {
                 "",
                 "Следующую цель выбирает по близости — не бегает через всю шахту туда-сюда.",
                 "После каждой цели подбирает валяющийся рядом дроп этого ресурса.",
-                "Когда склад задан, при полном инвентаре (и после конца сбора) игрок сам идёт",
-                "к сундуку через Baritone — при необходимости прокапываясь, — выгружает всё,",
-                "кроме инструмента в руке, и продолжает с того же места."
+                "Контейнер на складе полон — идёт к следующему в радиусе 8 от якоря.",
+                "Без схематики конкретный ресурс умеет серверный бот: /gatherbot <имя> collect <блок> [кол-во]."
         );
     }
 }

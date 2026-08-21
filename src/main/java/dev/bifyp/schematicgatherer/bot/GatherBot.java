@@ -23,6 +23,9 @@ import java.util.Set;
 /**
  * Фейковый игрок-сборщик. Спавн повторяет EntityPlayerMPFake из Carpet:
  * офлайн-UUID, FakeClientConnection, placeNewPlayer — для сервера это полноценный игрок.
+ *
+ * «Бессердечный»: неуязвим от спавна и до команды /gatherbot <имя> kill —
+ * мобы, лава, падение и голод его не останавливают.
  */
 public final class GatherBot extends ServerPlayer {
 
@@ -45,6 +48,8 @@ public final class GatherBot extends ServerPlayer {
         bot.unsetRemoved();
         bot.getAttribute(Attributes.STEP_HEIGHT).setBaseValue(0.6F);
         bot.gameMode.changeGameModeForPlayer(GameType.SURVIVAL);
+        // неуязвим от спавна и до команды kill
+        bot.setInvulnerable(true);
         // чтобы другие игроки увидели бота сразу, а не после первого движения
         server.getPlayerList().broadcastAll(
                 new ClientboundRotateHeadPacket(bot, (byte) (bot.yHeadRot * 256 / 360)), level.dimension());
