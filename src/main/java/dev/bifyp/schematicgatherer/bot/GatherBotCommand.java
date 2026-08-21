@@ -62,6 +62,8 @@ public final class GatherBotCommand {
                 .then(argument("bot", StringArgumentType.word())
                         .then(literal("kill").executes(GatherBotCommand::kill))
                         .then(literal("stop").executes(GatherBotCommand::stop))
+                        .then(literal("pause").executes(GatherBotCommand::pause))
+                        .then(literal("resume").executes(GatherBotCommand::resume))
                         .then(literal("status").executes(GatherBotCommand::status))
                         .then(literal("skip")
                                 .executes(GatherBotCommand::skipCurrent)
@@ -100,7 +102,8 @@ public final class GatherBotCommand {
         ServerLevel level = c.getSource().getLevel();
         Vec2 rot = c.getSource().getRotation();
         GatherBot.spawn(name, server, level, pos, rot.y, rot.x);
-        c.getSource().sendSystemMessage(Component.literal("§a[бот] «" + name + "» заспавнен (неуязвим до kill). "
+        BotPersistence.save(server);
+        c.getSource().sendSystemMessage(Component.literal("§a[бот] «" + name + "» заспавнен (неуязвим до kill, переживает рестарт). "
                 + "Выдай кирку, задай склад (deposit here) и команду gather/collect :)"));
         return 1;
     }
@@ -110,6 +113,7 @@ public final class GatherBotCommand {
         if (bot == null) return 0;
         bot.brain.stopJob(false);
         bot.kill(Component.literal("Killed by command"));
+        BotPersistence.save(c.getSource().getServer());
         c.getSource().sendSystemMessage(Component.literal("§e[бот] «" + bot.getGameProfile().name() + "» отключён"));
         return 1;
     }
@@ -118,6 +122,23 @@ public final class GatherBotCommand {
         GatherBot bot = getBot(c);
         if (bot == null) return 0;
         bot.brain.stopJob(true);
+        return 1;
+    }
+
+    private static int pause(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        bot.brain.setPaused(true);
+        c.getSource().sendSystemMessage(Component.literal("§e[бот] «" + bot.getGameProfile().name()
+                + "» на паузе (прогресс сохранён). Продолжить: /gatherbot " + bot.getGameProfile().name() + " resume"));
+        return 1;
+    }
+
+    private static int resume(CommandContext<CommandSourceStack> c) {
+        GatherBot bot = getBot(c);
+        if (bot == null) return 0;
+        bot.brain.setPaused(false);
+        c.getSource().sendSystemMessage(Component.literal("§a[бот] «" + bot.getGameProfile().name() + "» продолжает"));
         return 1;
     }
 
@@ -232,6 +253,7 @@ public final class GatherBotCommand {
             return 0;
         }
         bot.brain.setDeposit(pos);
+        BotPersistence.save(c.getSource().getServer());
         c.getSource().sendSystemMessage(Component.literal("§a[бот] склад для «" + bot.getGameProfile().name() + "»: " + pos.toShortString()
                 + " (контейнеры рядом — тоже склад)"));
         return 1;
@@ -241,6 +263,7 @@ public final class GatherBotCommand {
         GatherBot bot = getBot(c);
         if (bot == null) return 0;
         bot.brain.clearDeposit();
+        BotPersistence.save(c.getSource().getServer());
         c.getSource().sendSystemMessage(Component.literal("§e[бот] склад сброшен — будет копить всё в инвентаре"));
         return 1;
     }

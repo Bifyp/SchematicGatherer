@@ -20,9 +20,12 @@ import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -33,16 +36,16 @@ import java.util.UUID;
  * Движение без A* (прямая + прыжок через одиночный блок), с «мёртвыми зонами»
  * вокруг мест застревания и без спама в чат.
  *
- * Склад (depositAnchor, задаётся /gatherbot <имя> deposit ...). Разгрузка случается:
- *  - когда инвентарь полностью заполнен во время задачи;
- *  - после завершения задачи (если есть что нести);
- *  - по команде «deposit now» — в любой момент, даже без задачи.
+ * Склад (depositAnchor, задаётся /gatherbot <имя> deposit ...) — двусторонний:
+ *  - РАЗГРУЗКА: инвентарь полон / конец задачи / «deposit now» → телепорт на
+ *    склад, переложить всё (кроме инструмента в руке), телепорт обратно.
+ *    Контейнер полон/пропал — следующий в радиусе 8 от якоря (большой склад).
+ *  - ЗАБОР: в начале задачи бот телепортируется на склад и забирает то, что там
+ *    уже лежит по плану — добывает только остаток;
+ *  - ИНСТРУМЕНТ: кирка сломалась/не выдали — один раз на цель телепортируется
+ *    за подходящим инструментом на склад и возвращается.
  *
- * Раз бот всё равно неуязвимый фейк — к складу он ТЕЛЕПОРТИРУЕТСЯ (и обратно на
- * место добычи): никаких туннелей и «не могу добраться». Большой склад: контейнер
- * полон или пропал — берётся следующий контейнер в радиусе 8 (±3 по вертикали)
- * от якоря, туда тоже телепорт.
- *
+ * pause/resume: пауза замораживает задачу с сохранением прогресса.
  * skip: «skip» — пропустить текущую цель, «skip <id>» — вычеркнуть ресурс из плана.
  */
 public final class BotBrain {
@@ -76,15 +79,18 @@ public final class BotBrain {
     private UUID owner;
     private String jobName = "";
     private int radius = 48;
+    private boolean paused;
 
-    // склад (задаётся командой, живёт пока бот заспавнен)
+    // склад (задаётся командой, живёт пока бот заспавнен; переживает рестарт)
     private BlockPos depositAnchor;   // центр склада — то, что задали командой
-    private BlockPos depositPos;      // контейнер, в который складываем прямо сейчас
+    private BlockPos depositPos;      // контейнер, с которым работаем прямо сейчас
     private final Set<BlockPos> triedChests = new HashSet<>();
     private BlockPos depositReturnPos; // откуда телепортнулись на склад — сюда возвращаемся
     private boolean depositRequested;
     private boolean chestUnreachable;
     private boolean warnedFull;
+    private boolean needWithdraw;      // забрать со склада перед началом добычи
+    private boolean toolFetchTried;    // за инструментом на склад сходили (один раз на цель)
 
     public BotBrain(GatherBot bot) {
         this.bot = bot;
@@ -92,6 +98,21 @@ public final class BotBrain {
 
     public boolean isRunning() {
         return current != null || !queue.isEmpty();
+    }
+
+    public boolean isPaused() {
+        return paused;
+    }
+
+    /** Пауза замораживает задачу, прогресс (очередь, текущая цель) сохраняется. */
+    public void setPaused(boolean value) {
+        paused = value;
+        if (value) {
+            abortMining();
+            bot.zza = 0;
+            bot.xxa = 0;
+            bot.setSprinting(false);
+        }
     }
 
     public void startJob(String name, List<GatherTarget> targets, UUID owner, int radius) {
@@ -105,6 +126,7 @@ public final class BotBrain {
         warnedFull = false;
         triedChests.clear();
         depositPos = depositAnchor;
+        needWithdraw = depositAnchor != null; // сначала забираем со склада, что там уже есть
         tell("§a[бот] задача «" + name + "»: позиций " + targets.size() + ", радиус поиска " + radius
                 + (depositAnchor == null ? "" : ", склад: " + depositAnchor.toShortString()));
     }
@@ -120,10 +142,12 @@ public final class BotBrain {
         deadZones.clear();
         depositRequested = false;
         depositReturnPos = null;
+        needWithdraw = false;
         if (report) tell("§e[бот] задача остановлена.");
     }
 
     public String status() {
+        if (paused) return "на паузе («" + jobName + "», в очереди " + queue.size() + "). Продолжить: resume";
         if (!isRunning()) return "нет активной задачи";
         if (current == null) return "«" + jobName + "»: между задачами, в очереди " + queue.size();
         return "«" + jobName + "»: " + current.label() + " " + countItem(current.item()) + "/" + current.needed()
@@ -203,6 +227,7 @@ public final class BotBrain {
             stopJob(false);
             return;
         }
+        if (paused) return;
 
         // разгрузка по команде / после задачи — работает и без активной задачи
         if (depositRequested) {
@@ -215,6 +240,12 @@ public final class BotBrain {
             return;
         }
 
+        // забор со склада перед стартом добычи (один раз на задачу)
+        if (needWithdraw) {
+            needWithdraw = false;
+            withdrawFromWarehouse();
+        }
+
         if (current == null) {
             if (queue.isEmpty()) return;
             current = queue.poll();
@@ -225,6 +256,7 @@ public final class BotBrain {
             skippedUnreachable = 0;
             stuckTicks = 0;
             scanCooldown = 0;
+            toolFetchTried = false;
             lastPos = bot.blockPosition();
         }
 
@@ -277,6 +309,7 @@ public final class BotBrain {
         } else {
             bot.zza = 0;
             bot.setSprinting(false);
+            fetchToolIfNeeded(level().getBlockState(targetPos));
             mine(targetPos);
         }
     }
@@ -338,6 +371,84 @@ public final class BotBrain {
         return skippedUnreachable == 0 ? "" : " (недоступных блоков пропущено: " + skippedUnreachable + ")";
     }
 
+    // ---------- склад: забор и инструменты ----------
+
+    /** Перед добычей забираем со склада то, что там уже лежит по плану (добыча — только остаток). */
+    private void withdrawFromWarehouse() {
+        if (depositAnchor == null) return;
+        Map<Item, Integer> need = new HashMap<>();
+        if (current != null) need.merge(current.item(), current.needed(), Integer::sum);
+        for (GatherTarget t : queue) need.merge(t.item(), t.needed(), Integer::sum);
+        need.replaceAll((item, n) -> Math.max(0, n - countItem(item)));
+        need.values().removeIf(n -> n <= 0);
+        if (need.isEmpty()) return;
+        List<BlockPos> chests = findAllChests();
+        if (chests.isEmpty()) return;
+
+        BlockPos back = bot.blockPosition();
+        teleportNear(depositAnchor);
+        int took = 0;
+        for (BlockPos chestPos : chests) {
+            if (!(level().getBlockEntity(chestPos) instanceof Container container)) continue;
+            for (int i = 0; i < container.getContainerSize(); i++) {
+                ItemStack stack = container.getItem(i);
+                if (stack.isEmpty()) continue;
+                Integer remaining = need.get(stack.getItem());
+                if (remaining == null || remaining <= 0) continue;
+                int take = Math.min(stack.getCount(), remaining);
+                ItemStack taken = container.removeItem(i, take);
+                int before = taken.getCount();
+                bot.getInventory().addItem(taken);
+                int used = before - taken.getCount();
+                if (taken.getCount() > 0) container.setItem(i, taken); // не влезло — вернуть
+                if (used > 0) {
+                    need.merge(stack.getItem(), -used, Integer::sum);
+                    took += used;
+                }
+                container.setChanged();
+            }
+        }
+        teleportBack(back);
+        if (took > 0) tell("§7[бот] забрал со склада " + took + " предм. — добуду только остаток");
+    }
+
+    /** Кирка сломалась/не выдали — берём подходящий инструмент со склада (один раз на цель). */
+    private void fetchToolIfNeeded(BlockState state) {
+        if (toolFetchTried || depositAnchor == null) return;
+        Inventory inv = bot.getInventory();
+        float best = 1.0F;
+        for (int i = 0; i < 9; i++) {
+            best = Math.max(best, inv.getItem(i).getDestroySpeed(state));
+        }
+        if (best > 1.0F) return; // инструмент в хотбаре есть
+        toolFetchTried = true;
+        List<BlockPos> chests = findAllChests();
+        if (chests.isEmpty()) return;
+
+        BlockPos back = bot.blockPosition();
+        teleportNear(depositAnchor);
+        boolean found = false;
+        outer:
+        for (BlockPos chestPos : chests) {
+            if (!(level().getBlockEntity(chestPos) instanceof Container container)) continue;
+            for (int i = 0; i < container.getContainerSize(); i++) {
+                ItemStack stack = container.getItem(i);
+                if (stack.isEmpty() || stack.getDestroySpeed(state) <= 1.0F) continue;
+                ItemStack taken = container.removeItem(i, 1);
+                int before = taken.getCount();
+                bot.getInventory().addItem(taken);
+                if (taken.getCount() > 0) container.setItem(i, taken); // не влезло — вернуть
+                if (taken.getCount() < before) {
+                    container.setChanged();
+                    found = true;
+                }
+                break outer;
+            }
+        }
+        teleportBack(back);
+        if (found) tell("§7[бот] взял инструмент со склада");
+    }
+
     // ---------- склад: телепорт туда, разгрузка, телепорт обратно ----------
 
     private enum DepositResult { DONE, NEXT_CHEST, FAILED }
@@ -363,6 +474,11 @@ public final class BotBrain {
                 Set.of(), bot.getYRot(), bot.getXRot(), true);
     }
 
+    private void teleportBack(BlockPos back) {
+        bot.teleportTo(level(), back.getX() + 0.5, back.getY(), back.getZ() + 0.5,
+                Set.of(), bot.getYRot(), bot.getXRot(), true);
+    }
+
     /** Соседняя клетка с полом и двумя воздухами; запасной вариант — встать на контейнер. */
     private BlockPos findTeleportSpot(BlockPos chest) {
         ServerLevel level = level();
@@ -383,8 +499,7 @@ public final class BotBrain {
     /** Возврат туда, откуда телепортнулись на склад. */
     private void returnHome() {
         if (depositReturnPos != null) {
-            bot.teleportTo(level(), depositReturnPos.getX() + 0.5, depositReturnPos.getY(),
-                    depositReturnPos.getZ() + 0.5, Set.of(), bot.getYRot(), bot.getXRot(), true);
+            teleportBack(depositReturnPos);
             depositReturnPos = null;
         }
     }
@@ -445,28 +560,32 @@ public final class BotBrain {
         return true;
     }
 
-    /** Следующий неиспользованный контейнер вокруг якоря склада, ближайший первым. */
+    /** Следующий неиспользованный контейнер склада (по близости к якорю). */
     private BlockPos findNextChest() {
+        for (BlockPos p : findAllChests()) {
+            if (!triedChests.contains(p)) return p;
+        }
+        return null;
+    }
+
+    /** Все контейнеры склада вокруг якоря, ближайшие первыми. */
+    private List<BlockPos> findAllChests() {
+        List<BlockPos> out = new ArrayList<>();
+        if (depositAnchor == null) return out;
         ServerLevel level = level();
-        BlockPos best = null;
-        double bestDist = Double.MAX_VALUE;
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
         for (int dy = -WAREHOUSE_VERTICAL; dy <= WAREHOUSE_VERTICAL; dy++) {
             for (int dx = -WAREHOUSE_RADIUS; dx <= WAREHOUSE_RADIUS; dx++) {
                 for (int dz = -WAREHOUSE_RADIUS; dz <= WAREHOUSE_RADIUS; dz++) {
                     pos.set(depositAnchor.getX() + dx, depositAnchor.getY() + dy, depositAnchor.getZ() + dz);
                     if (!level.hasChunkAt(pos)) continue;
-                    if (triedChests.contains(pos.immutable())) continue;
                     if (!(level.getBlockEntity(pos) instanceof Container)) continue;
-                    double d = pos.distSqr(depositAnchor);
-                    if (d < bestDist) {
-                        bestDist = d;
-                        best = pos.immutable();
-                    }
+                    out.add(pos.immutable());
                 }
             }
         }
-        return best;
+        out.sort(Comparator.comparingDouble(p -> p.distSqr(depositAnchor)));
+        return out;
     }
 
     private boolean isInventoryFull() {
